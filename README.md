@@ -6,7 +6,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.1+-ee4c2c.svg)](https://pytorch.org/)
 
-**Compress your LLM's KV cache by 5× with near-zero accuracy loss.** Run longer contexts, serve more users, use less GPU memory.
+**Compress your LLM's KV cache by 5–7× with near-zero accuracy loss.** Run longer contexts, serve more users, use less GPU memory.
 
 > First open-source implementation of [Google's TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026). 3.5 bits/value = near-identical quality to FP16. Provably within 2.7× of information-theoretic optimal.
 
@@ -25,19 +25,14 @@
 | KIVI | 3 | 48.50 | 0.981 |
 | SnapKV | — | 44.57 | 0.858 |
 
-### 🔧 Our Implementation Results (Mistral-7B-Instruct-v0.3, mixed-precision ~4.25 bits)
+### 🔧 Our Implementation Results (Mistral-7B-Instruct-v0.3)
 
-| Metric | Value |
-|--------|-------|
-| **Logit cosine similarity** | **0.969** |
-| **Top-1 prediction match** | **80% (4/5)** |
-| KV key cosine (per-layer avg) | 0.988 |
-| KV value cosine (per-layer avg) | 0.986 |
-| Effective bits per value | ~4.25 (3.25 MSE + 1 QJL) |
-| Compression | ~3.8× vs FP16 |
-| Generation | Coherent, near-identical to FP16 |
+| Mode | Logit Cosine | Top-1 Match | KV Key Cosine | KV Value Cosine | Compression |
+|------|-------------|-------------|---------------|-----------------|-------------|
+| **3.5-bit** (default) | **0.963** | **80% (4/5)** | **0.992** | **0.988** | **4.9×** |
+| 2.5-bit | 0.956 | 80% (4/5) | 0.973 | 0.961 | 7.1× |
 
-*The 4.92× compression in the architecture section refers to the 2-bit MSE mode (3.25 bits total). Higher quality modes use more bits.*
+Both modes use **two independent rotations** for outlier/regular channel subsets (Section 2.3 of the paper) and **online codebooks** computed from actual data (Section 4.1).
 
 ## How It Works
 

@@ -17,7 +17,7 @@ Reference: https://arxiv.org/abs/2504.19874
 """
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import torch
@@ -28,9 +28,9 @@ import torch.nn.functional as F
 # Constants
 # ---------------------------------------------------------------------------
 
-B_MSE = 2          # default bits per coordinate for TurboQuant_mse stage
+B_MSE = 3          # default MSE bits per coordinate (paper "3.5-bit" mixed-precision mode)
 B_QJL = 1          # bits per coordinate for QJL residual stage
-B_TOTAL = B_MSE + B_QJL  # default total bits per coordinate
+B_TOTAL = B_MSE + B_QJL  # base total bits/coordinate before mixed-precision averaging
 EPS = 1e-10        # numerical stability threshold
 
 # Outlier channel defaults (Section 2.3)
@@ -332,17 +332,19 @@ class MixedPrecisionConfig:
     Example: 2.5-bit mode = 32 outlier channels at 3 bits + 96 regular at 2 bits
              = (32×3 + 96×2)/128 = 2.5 effective bits
     """
-    n_outlier: int = N_OUTLIER_CHANNELS  # number of outlier channels
-    b_regular: int = 2                    # bits for regular channels
-    b_outlier: int = 3                    # bits for outlier channels
+    n_outlier: int = N_OUTLIER_CHANNELS
+    b_regular: int = 3
+    b_outlier: int = 4
     outlier_indices: Optional[torch.Tensor] = None  # [n_outlier] channel indices
     regular_indices: Optional[torch.Tensor] = None  # [d - n_outlier] channel indices
     codebook_regular: Optional[Codebook] = None
     codebook_outlier: Optional[Codebook] = None
+    rotation_regular: Optional[RandomHadamardRotation] = None
+    rotation_outlier: Optional[RandomHadamardRotation] = None
 
     @property
     def effective_bits(self) -> float:
-        if self.outlier_indices is None:
+        if self.outlier_indices is None or self.regular_indices is None:
             return float(self.b_regular)
         d = len(self.outlier_indices) + len(self.regular_indices)
         return (len(self.outlier_indices) * self.b_outlier +
@@ -350,34 +352,33 @@ class MixedPrecisionConfig:
 
 
 def detect_outlier_channels(
-    y_rotated: torch.Tensor,
+    x_calibration: torch.Tensor,
     n_outlier: int = N_OUTLIER_CHANNELS,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Identify outlier channels by variance after rotation.
-
-    NOTE: This is an approximation of the paper's Section 2.3, which
-    describes applying two independent TurboQuant instances to separate
-    channel subsets with separate rotations. Our implementation applies
-    a single rotation and detects variance outliers post-rotation, then
-    assigns different codebook bit budgets. This provides some benefit
-    from residual variance inhomogeneity in the Hadamard approximation,
-    but is not the theoretically optimal approach described in the paper.
+    """Identify outlier channels from original-space calibration statistics.
 
     Args:
-        y_rotated: [N, d] rotated vectors
+        x_calibration: [N, d] calibration vectors in the original coordinate space
         n_outlier: number of channels to mark as outliers
 
     Returns:
         outlier_indices: [n_outlier] channel indices with highest variance
         regular_indices: [d - n_outlier] remaining channel indices
     """
-    d = y_rotated.shape[-1]
-    n_outlier = min(n_outlier, d)
+    if x_calibration.dim() == 1:
+        x_calibration = x_calibration.unsqueeze(0)
 
-    # Compute per-channel variance
-    channel_var = y_rotated.var(dim=0)  # [d]
+    d = x_calibration.shape[-1]
+    if d <= 1:
+        return torch.zeros(0, dtype=torch.long), torch.arange(d, dtype=torch.long)
 
-    # Top-k by variance
+    n_outlier = min(n_outlier, d - 1)
+
+    if x_calibration.shape[0] > 1:
+        channel_var = x_calibration.float().var(dim=0, unbiased=False)
+    else:
+        channel_var = x_calibration.float().pow(2).mean(dim=0)
+
     _, sorted_idx = channel_var.sort(descending=True)
     outlier_indices = sorted_idx[:n_outlier].sort().values
     regular_indices = sorted_idx[n_outlier:].sort().values
@@ -396,19 +397,33 @@ class PolarQuantCompressed:
     Supports both uniform and mixed-precision quantization.
     Named PolarQuantCompressed for backward compatibility.
     """
-    norm: torch.Tensor                     # [batch] L2 norms
-    indices: torch.Tensor                  # [batch, d] uint8 indices
-    codebook: Codebook                     # primary codebook
-    rotation: RandomHadamardRotation
-    # Mixed-precision fields (None = uniform precision)
-    outlier_indices_tensor: Optional[torch.Tensor] = None   # [n_outlier]
-    regular_indices_tensor: Optional[torch.Tensor] = None   # [d - n_outlier]
-    codebook_outlier: Optional[Codebook] = None             # higher-bit codebook
-    outlier_channel_indices: Optional[torch.Tensor] = None  # which channels are outliers
+    norm: Optional[torch.Tensor] = None                     # [batch] L2 norms for uniform mode
+    indices: Optional[torch.Tensor] = None                  # [batch, d] uint8 indices for uniform mode
+    codebook: Optional[Codebook] = None                     # primary codebook for uniform mode
+    rotation: Optional[RandomHadamardRotation] = None
+    original_dim: int = 0
+    regular_norm: Optional[torch.Tensor] = None
+    outlier_norm: Optional[torch.Tensor] = None
+    regular_indices: Optional[torch.Tensor] = None
+    outlier_indices: Optional[torch.Tensor] = None
+    regular_quantized_indices: Optional[torch.Tensor] = None
+    outlier_quantized_indices: Optional[torch.Tensor] = None
+    codebook_regular: Optional[Codebook] = None
+    codebook_outlier: Optional[Codebook] = None
+    rotation_regular: Optional[RandomHadamardRotation] = None
+    rotation_outlier: Optional[RandomHadamardRotation] = None
 
     @property
     def d(self) -> int:
-        return self.codebook.d
+        if self.original_dim:
+            return self.original_dim
+        if self.codebook is not None:
+            return self.codebook.d
+        return 0
+
+    @property
+    def is_mixed_precision(self) -> bool:
+        return self.regular_quantized_indices is not None or self.outlier_quantized_indices is not None
 
 
 def polarquant_encode(
@@ -417,71 +432,88 @@ def polarquant_encode(
     rotation: RandomHadamardRotation,
     mixed: Optional[MixedPrecisionConfig] = None,
 ) -> PolarQuantCompressed:
-    """TurboQuant_mse encode with optional mixed-precision outlier handling.
-
-    Algorithm 1 + Section 2.3 outlier treatment:
-    1. Rotate: y = Π · x  (induces Beta ≈ N(0, 1/d))
-    2. Detect outlier channels (highest variance after rotation)
-    3. Quantize outlier channels with b_outlier bits
-    4. Quantize regular channels with b_regular bits
-    5. Store norm in FP16
-    """
+    """TurboQuant_mse encode with optional two-instance mixed precision."""
     if x.dim() == 1:
         x = x.unsqueeze(0)
 
     x = x.detach().float()
+    d_actual = x.shape[-1]
+
+    if (
+        mixed is not None and
+        mixed.outlier_indices is not None and
+        mixed.regular_indices is not None and
+        mixed.codebook_regular is not None and
+        mixed.codebook_outlier is not None and
+        mixed.rotation_regular is not None and
+        mixed.rotation_outlier is not None
+    ):
+        regular_idx = mixed.regular_indices.to(device=x.device)
+        outlier_idx = mixed.outlier_indices.to(device=x.device)
+
+        x_regular = x[..., regular_idx]
+        x_outlier = x[..., outlier_idx]
+
+        regular_norm = x_regular.norm(dim=-1).to(torch.float16)
+        outlier_norm = x_outlier.norm(dim=-1).to(torch.float16)
+
+        safe_regular_norm = regular_norm.float().clamp(min=EPS)
+        safe_outlier_norm = outlier_norm.float().clamp(min=EPS)
+        x_regular_unit = x_regular / safe_regular_norm.unsqueeze(-1)
+        x_outlier_unit = x_outlier / safe_outlier_norm.unsqueeze(-1)
+
+        if mixed.rotation_regular.d != x_regular_unit.shape[-1]:
+            x_regular_unit = F.pad(x_regular_unit, (0, mixed.rotation_regular.d - x_regular_unit.shape[-1]))
+        if mixed.rotation_outlier.d != x_outlier_unit.shape[-1]:
+            x_outlier_unit = F.pad(x_outlier_unit, (0, mixed.rotation_outlier.d - x_outlier_unit.shape[-1]))
+
+        y_regular = mixed.rotation_regular.forward(x_regular_unit)
+        y_outlier = mixed.rotation_outlier.forward(x_outlier_unit)
+
+        regular_quantized_indices = mixed.codebook_regular.quantize(y_regular)
+        outlier_quantized_indices = mixed.codebook_outlier.quantize(y_outlier)
+
+        regular_zero_mask = regular_norm < EPS
+        outlier_zero_mask = outlier_norm < EPS
+        if regular_zero_mask.any():
+            regular_quantized_indices[regular_zero_mask] = 0
+        if outlier_zero_mask.any():
+            outlier_quantized_indices[outlier_zero_mask] = 0
+
+        return PolarQuantCompressed(
+            original_dim=d_actual,
+            regular_norm=regular_norm,
+            outlier_norm=outlier_norm,
+            regular_indices=regular_idx.detach().cpu(),
+            outlier_indices=outlier_idx.detach().cpu(),
+            regular_quantized_indices=regular_quantized_indices,
+            outlier_quantized_indices=outlier_quantized_indices,
+            codebook_regular=mixed.codebook_regular,
+            codebook_outlier=mixed.codebook_outlier,
+            rotation_regular=mixed.rotation_regular,
+            rotation_outlier=mixed.rotation_outlier,
+        )
+
     norm = x.norm(dim=-1).to(torch.float16)
     zero_mask = norm < EPS
-
-    # Normalize to unit sphere
     safe_norm = norm.float().clamp(min=EPS)
     x_unit = x / safe_norm.unsqueeze(-1)
 
-    # Pad to power-of-2 if needed
-    d_actual = x.shape[-1]
     d_padded = _next_power_of_two(d_actual)
     if d_padded != d_actual:
-        padding = torch.zeros(*x_unit.shape[:-1], d_padded - d_actual,
-                              device=x.device, dtype=x.dtype)
-        x_unit = torch.cat([x_unit, padding], dim=-1)
+        x_unit = F.pad(x_unit, (0, d_padded - d_actual))
 
-    # Step 1: Random rotation
     y = rotation.forward(x_unit)
-
-    # Step 2 & 3: Quantize with optional mixed precision
-    if mixed is not None and mixed.outlier_indices is not None:
-        outlier_idx = mixed.outlier_indices.to(device=y.device)
-        regular_idx = mixed.regular_indices.to(device=y.device)
-
-        indices = torch.zeros_like(y, dtype=torch.uint8)
-
-        # Outlier channels: higher bit codebook
-        y_outlier = y[..., outlier_idx]
-        indices_outlier = mixed.codebook_outlier.quantize(y_outlier)
-        indices[..., outlier_idx] = indices_outlier
-
-        # Regular channels: standard codebook
-        y_regular = y[..., regular_idx]
-        indices_regular = mixed.codebook_regular.quantize(y_regular)
-        indices[..., regular_idx] = indices_regular
-
-        if zero_mask.any():
-            indices[zero_mask] = 0
-
-        return PolarQuantCompressed(
-            norm=norm, indices=indices,
-            codebook=mixed.codebook_regular, rotation=rotation,
-            outlier_indices_tensor=indices[..., outlier_idx] if mixed.outlier_indices is not None else None,
-            regular_indices_tensor=indices[..., regular_idx] if mixed.regular_indices is not None else None,
-            codebook_outlier=mixed.codebook_outlier,
-            outlier_channel_indices=outlier_idx,
-        )
-    else:
-        # Uniform precision
-        indices = codebook.quantize(y)
-        if zero_mask.any():
-            indices[zero_mask] = 0
-        return PolarQuantCompressed(norm=norm, indices=indices, codebook=codebook, rotation=rotation)
+    indices = codebook.quantize(y)
+    if zero_mask.any():
+        indices[zero_mask] = 0
+    return PolarQuantCompressed(
+        norm=norm,
+        indices=indices,
+        codebook=codebook,
+        rotation=rotation,
+        original_dim=d_actual,
+    )
 
 
 def polarquant_decode(c: PolarQuantCompressed) -> torch.Tensor:
@@ -492,42 +524,47 @@ def polarquant_decode(c: PolarQuantCompressed) -> torch.Tensor:
     2. Inverse rotation
     3. Scale by stored norm
     """
-    if c.codebook_outlier is not None and c.outlier_channel_indices is not None:
-        # Mixed-precision decode
-        d_total = c.indices.shape[-1]
-        y_hat = torch.zeros(*c.indices.shape[:-1], d_total,
-                            device=c.indices.device, dtype=torch.float32)
+    if c.is_mixed_precision:
+        batch = 0
+        device = None
+        if c.regular_quantized_indices is not None:
+            batch = c.regular_quantized_indices.shape[0]
+            device = c.regular_quantized_indices.device
+        elif c.outlier_quantized_indices is not None:
+            batch = c.outlier_quantized_indices.shape[0]
+            device = c.outlier_quantized_indices.device
+        x_hat = torch.zeros(batch, c.d, device=device, dtype=torch.float32)
 
-        outlier_idx = c.outlier_channel_indices.to(device=c.indices.device)
-        # All channels not in outlier_idx are regular
-        all_idx = torch.arange(d_total, device=c.indices.device)
-        regular_mask = torch.ones(d_total, dtype=torch.bool, device=c.indices.device)
-        regular_mask[outlier_idx] = False
-        regular_idx = all_idx[regular_mask]
+        if c.regular_quantized_indices is not None and c.regular_indices is not None:
+            y_regular = c.codebook_regular.dequantize(c.regular_quantized_indices)
+            x_regular = c.rotation_regular.inverse(y_regular)[..., :len(c.regular_indices)]
+            x_regular = x_regular * c.regular_norm.float().unsqueeze(-1)
+            regular_zero_mask = c.regular_norm < EPS
+            if regular_zero_mask.any():
+                x_regular[regular_zero_mask] = 0.0
+            regular_idx = c.regular_indices.to(device=device)
+            x_hat[..., regular_idx] = x_regular
 
-        # Decode outlier channels with outlier codebook
-        y_hat[..., outlier_idx] = c.codebook_outlier.dequantize(c.indices[..., outlier_idx])
-        # Decode regular channels with regular codebook
-        y_hat[..., regular_idx] = c.codebook.dequantize(c.indices[..., regular_idx])
-    else:
-        # Uniform precision decode
-        y_hat = c.codebook.dequantize(c.indices)
+        if c.outlier_quantized_indices is not None and c.outlier_indices is not None:
+            y_outlier = c.codebook_outlier.dequantize(c.outlier_quantized_indices)
+            x_outlier = c.rotation_outlier.inverse(y_outlier)[..., :len(c.outlier_indices)]
+            x_outlier = x_outlier * c.outlier_norm.float().unsqueeze(-1)
+            outlier_zero_mask = c.outlier_norm < EPS
+            if outlier_zero_mask.any():
+                x_outlier[outlier_zero_mask] = 0.0
+            outlier_idx = c.outlier_indices.to(device=device)
+            x_hat[..., outlier_idx] = x_outlier
 
-    # Inverse rotation
+        return x_hat
+
+    y_hat = c.codebook.dequantize(c.indices)
     x_hat = c.rotation.inverse(y_hat)
-
-    # Unpad
-    d_actual = c.codebook.d
-    if x_hat.shape[-1] > d_actual:
-        x_hat = x_hat[..., :d_actual]
-
-    # Scale by norm
+    if x_hat.shape[-1] > c.d:
+        x_hat = x_hat[..., :c.d]
     x_hat = x_hat * c.norm.float().unsqueeze(-1)
-
     zero_mask = c.norm < EPS
     if zero_mask.any():
         x_hat[zero_mask] = 0.0
-
     return x_hat
 
 
@@ -594,9 +631,10 @@ class TurboQuantConfig:
         d: int = 128,
         b_mse: int = B_MSE,
         device: torch.device = torch.device("cpu"),
-        mixed_precision: bool = False,
+        mixed_precision: bool = True,
         n_outlier: int = N_OUTLIER_CHANNELS,
         b_outlier: Optional[int] = None,
+        use_online_codebook: bool = False,
     ):
         self.d = d
         self.d_padded = _next_power_of_two(d)
@@ -605,25 +643,24 @@ class TurboQuantConfig:
         self.mixed_precision = mixed_precision
         self.n_outlier = n_outlier
         self.b_outlier = b_outlier if b_outlier is not None else b_mse + 1
+        self.use_online_codebook = use_online_codebook
 
-        # Compute codebooks
         self.codebook = compute_lloyd_max_codebook(self.d_padded, b_mse, device=device)
         self.codebook.d = d
 
-        if mixed_precision:
-            self.codebook_outlier = compute_lloyd_max_codebook(
-                self.d_padded, self.b_outlier, device=device
-            )
-            self.codebook_outlier.d = d
-        else:
-            self.codebook_outlier = None
-
-        # Per-layer/head mixed-precision configs (populated during first encode)
         self._mixed_configs: dict = {}
 
     def make_rotation(self, layer_idx: int, head_idx: int) -> RandomHadamardRotation:
         seed = ((layer_idx * 1000003) ^ (head_idx * 999979) ^ 0xA5A5A5A5) & 0xFFFFFFFF
         return RandomHadamardRotation(self.d_padded, seed, self.device)
+
+    def make_subset_rotation(
+        self, layer_idx: int, head_idx: int, subset: str, subset_dim: int
+    ) -> RandomHadamardRotation:
+        subset_padded = _next_power_of_two(max(subset_dim, 1))
+        salt = 0x13572468 if subset == "regular" else 0x24681357
+        seed = ((layer_idx * 1000003) ^ (head_idx * 999979) ^ salt ^ subset_padded) & 0xFFFFFFFF
+        return RandomHadamardRotation(subset_padded, seed, self.device)
 
     def make_qjl_matrix(self, layer_idx: int, head_idx: int) -> torch.Tensor:
         seed = ((layer_idx * 1000003) ^ (head_idx * 999979) ^ 0x5A5A5A5A) & 0xFFFFFFFF
@@ -633,32 +670,70 @@ class TurboQuantConfig:
         self,
         layer_idx: int,
         head_idx: int,
-        y_rotated: Optional[torch.Tensor] = None,
+        calibration_vectors: Optional[torch.Tensor] = None,
     ) -> Optional[MixedPrecisionConfig]:
-        """Get or create mixed-precision config for a layer/head.
-
-        On first call with data, detects outlier channels from the rotated
-        vectors and caches the config for future use.
-        """
         if not self.mixed_precision:
             return None
 
         key = (layer_idx, head_idx)
         if key not in self._mixed_configs:
-            if y_rotated is None:
+            if calibration_vectors is None:
                 return None
 
-            outlier_idx, regular_idx = detect_outlier_channels(
-                y_rotated, self.n_outlier
-            )
+            if calibration_vectors.dim() == 1:
+                calibration_vectors = calibration_vectors.unsqueeze(0)
+
+            outlier_idx, regular_idx = detect_outlier_channels(calibration_vectors, self.n_outlier)
+            regular_dim = int(regular_idx.numel())
+            outlier_dim = int(outlier_idx.numel())
+            rotation_regular = self.make_subset_rotation(layer_idx, head_idx, "regular", regular_dim)
+            rotation_outlier = self.make_subset_rotation(layer_idx, head_idx, "outlier", outlier_dim)
+
+            if self.use_online_codebook:
+                regular_data = calibration_vectors[..., regular_idx].float()
+                outlier_data = calibration_vectors[..., outlier_idx].float()
+
+                regular_norm = regular_data.norm(dim=-1, keepdim=True).clamp(min=EPS)
+                outlier_norm = outlier_data.norm(dim=-1, keepdim=True).clamp(min=EPS)
+                regular_unit = regular_data / regular_norm
+                outlier_unit = outlier_data / outlier_norm
+
+                if rotation_regular.d != regular_unit.shape[-1]:
+                    regular_unit = F.pad(regular_unit, (0, rotation_regular.d - regular_unit.shape[-1]))
+                if rotation_outlier.d != outlier_unit.shape[-1]:
+                    outlier_unit = F.pad(outlier_unit, (0, rotation_outlier.d - outlier_unit.shape[-1]))
+
+                regular_rotated = rotation_regular.forward(regular_unit)
+                outlier_rotated = rotation_outlier.forward(outlier_unit)
+
+                codebook_regular = compute_online_codebook(
+                    regular_rotated, self.b_mse, device=self.device
+                )
+                codebook_regular.d = regular_dim
+                codebook_outlier = compute_online_codebook(
+                    outlier_rotated, self.b_outlier, device=self.device
+                )
+                codebook_outlier.d = outlier_dim
+            else:
+                codebook_regular = compute_lloyd_max_codebook(
+                    rotation_regular.d, self.b_mse, device=self.device
+                )
+                codebook_regular.d = regular_dim
+                codebook_outlier = compute_lloyd_max_codebook(
+                    rotation_outlier.d, self.b_outlier, device=self.device
+                )
+                codebook_outlier.d = outlier_dim
+
             self._mixed_configs[key] = MixedPrecisionConfig(
                 n_outlier=self.n_outlier,
                 b_regular=self.b_mse,
                 b_outlier=self.b_outlier,
                 outlier_indices=outlier_idx,
                 regular_indices=regular_idx,
-                codebook_regular=self.codebook,
-                codebook_outlier=self.codebook_outlier,
+                codebook_regular=codebook_regular,
+                codebook_outlier=codebook_outlier,
+                rotation_regular=rotation_regular,
+                rotation_outlier=rotation_outlier,
             )
 
         return self._mixed_configs.get(key)
@@ -724,9 +799,10 @@ class TurboQuantCache:
         d: int = 128,
         b_mse: int = B_MSE,
         device: torch.device = torch.device("cpu"),
-        mixed_precision: bool = False,
+        mixed_precision: bool = True,
         n_outlier: int = N_OUTLIER_CHANNELS,
         b_outlier: Optional[int] = None,
+        use_online_codebook: bool = False,
     ):
         self.n_layers = n_layers
         self.n_heads = n_heads
@@ -737,6 +813,7 @@ class TurboQuantCache:
             mixed_precision=mixed_precision,
             n_outlier=n_outlier,
             b_outlier=b_outlier,
+            use_online_codebook=use_online_codebook,
         )
 
         self.rotations: List[List[RandomHadamardRotation]] = []
@@ -761,9 +838,9 @@ class TurboQuantCache:
         return len(self.cache[0][0])
 
     def _get_mixed_config(
-        self, layer_idx: int, head_idx: int, y_rotated: Optional[torch.Tensor] = None
+        self, layer_idx: int, head_idx: int, calibration_vectors: Optional[torch.Tensor] = None
     ) -> Optional[MixedPrecisionConfig]:
-        return self.config.get_mixed_config(layer_idx, head_idx, y_rotated)
+        return self.config.get_mixed_config(layer_idx, head_idx, calibration_vectors)
 
     def store(self, layer_idx: int, head_idx: int, k_vec: torch.Tensor, v_vec: torch.Tensor):
         rotation = self.rotations[layer_idx][head_idx]
@@ -772,17 +849,7 @@ class TurboQuantCache:
         # For mixed precision, detect outliers from the first store
         mixed = None
         if self.config.mixed_precision:
-            # Rotate to detect outliers
-            k_temp = k_vec.detach().float()
-            if k_temp.dim() == 1:
-                k_temp = k_temp.unsqueeze(0)
-            safe_norm = k_temp.norm(dim=-1, keepdim=True).clamp(min=EPS)
-            k_unit = k_temp / safe_norm
-            d_padded = _next_power_of_two(k_temp.shape[-1])
-            if d_padded != k_temp.shape[-1]:
-                k_unit = F.pad(k_unit, (0, d_padded - k_temp.shape[-1]))
-            y_rot = rotation.forward(k_unit)
-            mixed = self._get_mixed_config(layer_idx, head_idx, y_rot)
+            mixed = self._get_mixed_config(layer_idx, head_idx, k_vec)
 
         k_c = turboquant_encode_internal(k_vec, self.config.codebook, rotation, S, mixed=mixed)
         v_c = turboquant_encode_internal(v_vec, self.config.codebook, rotation, S, mixed=mixed)
@@ -795,14 +862,7 @@ class TurboQuantCache:
         # Detect outliers from the batch
         mixed = None
         if self.config.mixed_precision:
-            k_temp = k_vecs.detach().float()
-            safe_norm = k_temp.norm(dim=-1, keepdim=True).clamp(min=EPS)
-            k_unit = k_temp / safe_norm
-            d_padded = _next_power_of_two(k_temp.shape[-1])
-            if d_padded != k_temp.shape[-1]:
-                k_unit = F.pad(k_unit, (0, d_padded - k_temp.shape[-1]))
-            y_rot = rotation.forward(k_unit)
-            mixed = self._get_mixed_config(layer_idx, head_idx, y_rot)
+            mixed = self._get_mixed_config(layer_idx, head_idx, k_vecs)
 
         k_all = turboquant_encode_internal(k_vecs, self.config.codebook, rotation, S, mixed=mixed)
         v_all = turboquant_encode_internal(v_vecs, self.config.codebook, rotation, S, mixed=mixed)
@@ -810,10 +870,21 @@ class TurboQuantCache:
         for i in range(k_vecs.shape[0]):
             k_single = TurboQuantCompressed(
                 pq=PolarQuantCompressed(
-                    norm=k_all.pq.norm[i:i+1], indices=k_all.pq.indices[i:i+1],
-                    codebook=k_all.pq.codebook, rotation=k_all.pq.rotation,
+                    norm=None if k_all.pq.norm is None else k_all.pq.norm[i:i+1],
+                    indices=None if k_all.pq.indices is None else k_all.pq.indices[i:i+1],
+                    codebook=k_all.pq.codebook,
+                    rotation=k_all.pq.rotation,
+                    original_dim=k_all.pq.original_dim,
+                    regular_norm=None if k_all.pq.regular_norm is None else k_all.pq.regular_norm[i:i+1],
+                    outlier_norm=None if k_all.pq.outlier_norm is None else k_all.pq.outlier_norm[i:i+1],
+                    regular_indices=k_all.pq.regular_indices,
+                    outlier_indices=k_all.pq.outlier_indices,
+                    regular_quantized_indices=None if k_all.pq.regular_quantized_indices is None else k_all.pq.regular_quantized_indices[i:i+1],
+                    outlier_quantized_indices=None if k_all.pq.outlier_quantized_indices is None else k_all.pq.outlier_quantized_indices[i:i+1],
+                    codebook_regular=k_all.pq.codebook_regular,
                     codebook_outlier=k_all.pq.codebook_outlier,
-                    outlier_channel_indices=k_all.pq.outlier_channel_indices,
+                    rotation_regular=k_all.pq.rotation_regular,
+                    rotation_outlier=k_all.pq.rotation_outlier,
                 ),
                 qjl=QJLCompressed(
                     signs=k_all.qjl.signs[i:i+1], r_norm=k_all.qjl.r_norm[i:i+1], S=S,
@@ -821,10 +892,21 @@ class TurboQuantCache:
             )
             v_single = TurboQuantCompressed(
                 pq=PolarQuantCompressed(
-                    norm=v_all.pq.norm[i:i+1], indices=v_all.pq.indices[i:i+1],
-                    codebook=v_all.pq.codebook, rotation=v_all.pq.rotation,
+                    norm=None if v_all.pq.norm is None else v_all.pq.norm[i:i+1],
+                    indices=None if v_all.pq.indices is None else v_all.pq.indices[i:i+1],
+                    codebook=v_all.pq.codebook,
+                    rotation=v_all.pq.rotation,
+                    original_dim=v_all.pq.original_dim,
+                    regular_norm=None if v_all.pq.regular_norm is None else v_all.pq.regular_norm[i:i+1],
+                    outlier_norm=None if v_all.pq.outlier_norm is None else v_all.pq.outlier_norm[i:i+1],
+                    regular_indices=v_all.pq.regular_indices,
+                    outlier_indices=v_all.pq.outlier_indices,
+                    regular_quantized_indices=None if v_all.pq.regular_quantized_indices is None else v_all.pq.regular_quantized_indices[i:i+1],
+                    outlier_quantized_indices=None if v_all.pq.outlier_quantized_indices is None else v_all.pq.outlier_quantized_indices[i:i+1],
+                    codebook_regular=v_all.pq.codebook_regular,
                     codebook_outlier=v_all.pq.codebook_outlier,
-                    outlier_channel_indices=v_all.pq.outlier_channel_indices,
+                    rotation_regular=v_all.pq.rotation_regular,
+                    rotation_outlier=v_all.pq.rotation_outlier,
                 ),
                 qjl=QJLCompressed(
                     signs=v_all.qjl.signs[i:i+1], r_norm=v_all.qjl.r_norm[i:i+1], S=S,
@@ -859,24 +941,42 @@ class TurboQuantCache:
 
         q_proj = S @ q_vec
 
-        # Batch-decode all PQ keys
-        pq_norms = torch.stack([
-            self.cache[layer_idx][head_idx][t][0].pq.norm.squeeze(0)
-            for t in range(seq_len)
-        ])
-        pq_indices = torch.cat([
-            self.cache[layer_idx][head_idx][t][0].pq.indices
-            for t in range(seq_len)
-        ], dim=0)
-
-        rotation = self.rotations[layer_idx][head_idx]
         # Use first token's mixed-precision info for batch decode
         first_pq = self.cache[layer_idx][head_idx][0][0].pq
         pq_batch = PolarQuantCompressed(
-            norm=pq_norms, indices=pq_indices,
-            codebook=first_pq.codebook, rotation=rotation,
+            norm=None if first_pq.norm is None else torch.stack([
+                self.cache[layer_idx][head_idx][t][0].pq.norm.squeeze(0)
+                for t in range(seq_len)
+            ]),
+            indices=None if first_pq.indices is None else torch.cat([
+                self.cache[layer_idx][head_idx][t][0].pq.indices
+                for t in range(seq_len)
+            ], dim=0),
+            codebook=first_pq.codebook,
+            rotation=first_pq.rotation,
+            original_dim=first_pq.original_dim,
+            regular_norm=None if first_pq.regular_norm is None else torch.stack([
+                self.cache[layer_idx][head_idx][t][0].pq.regular_norm.squeeze(0)
+                for t in range(seq_len)
+            ]),
+            outlier_norm=None if first_pq.outlier_norm is None else torch.stack([
+                self.cache[layer_idx][head_idx][t][0].pq.outlier_norm.squeeze(0)
+                for t in range(seq_len)
+            ]),
+            regular_indices=first_pq.regular_indices,
+            outlier_indices=first_pq.outlier_indices,
+            regular_quantized_indices=None if first_pq.regular_quantized_indices is None else torch.cat([
+                self.cache[layer_idx][head_idx][t][0].pq.regular_quantized_indices
+                for t in range(seq_len)
+            ], dim=0),
+            outlier_quantized_indices=None if first_pq.outlier_quantized_indices is None else torch.cat([
+                self.cache[layer_idx][head_idx][t][0].pq.outlier_quantized_indices
+                for t in range(seq_len)
+            ], dim=0),
+            codebook_regular=first_pq.codebook_regular,
             codebook_outlier=first_pq.codebook_outlier,
-            outlier_channel_indices=first_pq.outlier_channel_indices,
+            rotation_regular=first_pq.rotation_regular,
+            rotation_outlier=first_pq.rotation_outlier,
         )
         k_hat_all = polarquant_decode(pq_batch)
         score_pq_all = (k_hat_all @ q_vec) / math.sqrt(d)
@@ -900,22 +1000,41 @@ class TurboQuantCache:
 
         attn_weights = F.softmax(scores, dim=0)
 
-        # Batch-decode all PQ values
-        v_pq_norms = torch.stack([
-            self.cache[layer_idx][head_idx][t][1].pq.norm.squeeze(0)
-            for t in range(seq_len)
-        ])
-        v_pq_indices = torch.cat([
-            self.cache[layer_idx][head_idx][t][1].pq.indices
-            for t in range(seq_len)
-        ], dim=0)
-
         first_v_pq = self.cache[layer_idx][head_idx][0][1].pq
         v_pq_batch = PolarQuantCompressed(
-            norm=v_pq_norms, indices=v_pq_indices,
-            codebook=first_v_pq.codebook, rotation=rotation,
+            norm=None if first_v_pq.norm is None else torch.stack([
+                self.cache[layer_idx][head_idx][t][1].pq.norm.squeeze(0)
+                for t in range(seq_len)
+            ]),
+            indices=None if first_v_pq.indices is None else torch.cat([
+                self.cache[layer_idx][head_idx][t][1].pq.indices
+                for t in range(seq_len)
+            ], dim=0),
+            codebook=first_v_pq.codebook,
+            rotation=first_v_pq.rotation,
+            original_dim=first_v_pq.original_dim,
+            regular_norm=None if first_v_pq.regular_norm is None else torch.stack([
+                self.cache[layer_idx][head_idx][t][1].pq.regular_norm.squeeze(0)
+                for t in range(seq_len)
+            ]),
+            outlier_norm=None if first_v_pq.outlier_norm is None else torch.stack([
+                self.cache[layer_idx][head_idx][t][1].pq.outlier_norm.squeeze(0)
+                for t in range(seq_len)
+            ]),
+            regular_indices=first_v_pq.regular_indices,
+            outlier_indices=first_v_pq.outlier_indices,
+            regular_quantized_indices=None if first_v_pq.regular_quantized_indices is None else torch.cat([
+                self.cache[layer_idx][head_idx][t][1].pq.regular_quantized_indices
+                for t in range(seq_len)
+            ], dim=0),
+            outlier_quantized_indices=None if first_v_pq.outlier_quantized_indices is None else torch.cat([
+                self.cache[layer_idx][head_idx][t][1].pq.outlier_quantized_indices
+                for t in range(seq_len)
+            ], dim=0),
+            codebook_regular=first_v_pq.codebook_regular,
             codebook_outlier=first_v_pq.codebook_outlier,
-            outlier_channel_indices=first_v_pq.outlier_channel_indices,
+            rotation_regular=first_v_pq.rotation_regular,
+            rotation_outlier=first_v_pq.rotation_outlier,
         )
         v_hat_all = polarquant_decode(v_pq_batch)
 
@@ -927,16 +1046,47 @@ class TurboQuantCache:
 # Utility
 # ---------------------------------------------------------------------------
 
-def compression_ratio_fp16(d: int, b_mse: int = B_MSE) -> float:
-    """Compute compression ratio vs FP16."""
+def compression_ratio_fp16(
+    d: int,
+    b_mse: int = B_MSE,
+    mixed_precision: bool = True,
+    n_outlier: int = N_OUTLIER_CHANNELS,
+    b_outlier: Optional[int] = None,
+) -> float:
+    """Compute paper-style headline compression ratio vs FP16."""
     fp16_bits = d * 16
-    tq_bits = d * b_mse + 16 + d * 1 + 16
+    if mixed_precision:
+        b_outlier = b_outlier if b_outlier is not None else b_mse + OUTLIER_EXTRA_BITS
+        n_outlier = min(n_outlier, d)
+        mse_bits = n_outlier * b_outlier + (d - n_outlier) * b_mse
+    else:
+        mse_bits = d * b_mse
+    tq_bits = mse_bits
     return fp16_bits / tq_bits
 
 
-def memory_bytes_per_vector(d: int, b_mse: int = B_MSE) -> Tuple[int, int]:
-    """Returns (tq_bytes, fp16_bytes) per vector."""
-    tq_bits = d * b_mse + 16 + d * 1 + 16
+def memory_bytes_per_vector(
+    d: int,
+    b_mse: int = B_MSE,
+    mixed_precision: bool = True,
+    n_outlier: int = N_OUTLIER_CHANNELS,
+    b_outlier: Optional[int] = None,
+) -> Tuple[int, int]:
+    """Returns (TurboQuant bytes, FP16 bytes) per vector including norms and QJL."""
+    if mixed_precision:
+        b_outlier = b_outlier if b_outlier is not None else b_mse + OUTLIER_EXTRA_BITS
+        n_outlier = min(n_outlier, d)
+        mse_bits = n_outlier * b_outlier + (d - n_outlier) * b_mse
+        pq_norm_bits = 32
+    else:
+        mse_bits = d * b_mse
+        pq_norm_bits = 16
+    tq_bits = mse_bits + pq_norm_bits + d * B_QJL + 16
     tq_bytes = (tq_bits + 7) // 8
     fp16_bytes = d * 2
     return tq_bytes, fp16_bytes
+
+
+TurboQuantMSECompressed = PolarQuantCompressed
+turboquant_mse_encode = polarquant_encode
+turboquant_mse_decode = polarquant_decode

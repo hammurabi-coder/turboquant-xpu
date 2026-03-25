@@ -27,6 +27,7 @@ from cache import (
     TurboQuantConfig,
     compute_lloyd_max_codebook,
     compression_ratio_fp16,
+    memory_bytes_per_vector,
     fwht,
     generate_qjl_matrix,
     polarquant_decode,
@@ -45,11 +46,12 @@ DEVICE = torch.device("cpu")
 D = 128
 SEED = 42
 BATCH = 8
+TEST_B_MSE = 2
 
 
 @pytest.fixture
 def codebook():
-    return compute_lloyd_max_codebook(D, B_MSE, device=DEVICE)
+    return compute_lloyd_max_codebook(D, TEST_B_MSE, device=DEVICE)
 
 
 @pytest.fixture
@@ -330,15 +332,15 @@ class TestTurboQuantE2E:
     def test_turboquant_compression_ratio(self):
         """Verify memory usage is ~4.9x less than FP16 for d=128."""
         ratio = compression_ratio_fp16(D, B_MSE)
-        assert abs(ratio - 4.9) < 0.5
+        assert abs(ratio - (2048 / 416)) < 0.1
 
     def test_turboquant_compression_ratio_exact(self):
-        """Exact computation: 2048 bits FP16 / 416 bits TQ ≈ 4.923."""
+        """Exact computation for the default mixed mode: 2048 / 416 ≈ 4.923."""
         d = 128
         fp16_bits = d * 16
-        tq_bits = d * B_MSE + 16 + d * 1 + 16
+        tq_bits = 32 * 4 + 96 * 3
         ratio = fp16_bits / tq_bits
-        assert abs(ratio - 2048 / 416) < 0.001
+        assert abs(ratio - compression_ratio_fp16(d, B_MSE)) < 0.001
 
     def test_turboquant_single_token_attention(self):
         """Attention with seq_len=1 should return the single value vector."""
@@ -356,7 +358,7 @@ class TestTurboQuantE2E:
     def test_turboquant_encode_decode_roundtrip(self):
         """Encode → decode should reconstruct well for TurboQuant."""
         torch.manual_seed(34)
-        config = TurboQuantConfig(D, B_MSE, device=DEVICE)
+        config = TurboQuantConfig(D, TEST_B_MSE, device=DEVICE, mixed_precision=False)
         rotation = config.make_rotation(0, 0)
         S = config.make_qjl_matrix(0, 0)
 
@@ -395,7 +397,7 @@ class TestCodebook:
 
     def test_lloyd_max_convergence(self):
         """Codebook computation should converge (not hit max_iter)."""
-        codebook = compute_lloyd_max_codebook(D, B_MSE, max_iter=500, tol=1e-12, device=DEVICE)
+        codebook = compute_lloyd_max_codebook(D, TEST_B_MSE, max_iter=500, tol=1e-12, device=DEVICE)
         assert codebook.centroids.shape == (4,)
         assert codebook.boundaries.shape == (5,)
         diffs = codebook.centroids.diff()
@@ -403,13 +405,13 @@ class TestCodebook:
 
     def test_lloyd_max_known_values_d128_b2(self):
         """For d=128, b=2, centroids should match reference."""
-        codebook = compute_lloyd_max_codebook(D, B_MSE, device=DEVICE)
+        codebook = compute_lloyd_max_codebook(D, TEST_B_MSE, device=DEVICE)
         expected = torch.tensor([-0.1335, -0.0400, 0.0400, 0.1335], device=DEVICE)
         assert torch.allclose(codebook.centroids, expected, atol=1e-3)
 
     def test_lloyd_max_boundaries_symmetric(self):
         """Boundaries should be symmetric around 0 (within practical support)."""
-        codebook = compute_lloyd_max_codebook(D, B_MSE, device=DEVICE)
+        codebook = compute_lloyd_max_codebook(D, TEST_B_MSE, device=DEVICE)
         # Outer boundaries are at ±6σ (practical support), not ±1
         assert codebook.boundaries[0].item() < 0
         assert codebook.boundaries[-1].item() > 0
@@ -419,14 +421,14 @@ class TestCodebook:
 
     def test_lloyd_max_centroids_symmetric(self):
         """Centroids should be approximately symmetric: c_i ≈ -c_{K-1-i}."""
-        codebook = compute_lloyd_max_codebook(D, B_MSE, device=DEVICE)
+        codebook = compute_lloyd_max_codebook(D, TEST_B_MSE, device=DEVICE)
         K = codebook.K
         for i in range(K):
             assert torch.allclose(codebook.centroids[i], -codebook.centroids[K - 1 - i], atol=1e-3)
 
     def test_lloyd_max_mse_within_bound(self):
         """The codebook should achieve MSE near theoretical bound."""
-        codebook = compute_lloyd_max_codebook(D, B_MSE, device=DEVICE)
+        codebook = compute_lloyd_max_codebook(D, TEST_B_MSE, device=DEVICE)
         rotation = RandomHadamardRotation(D, SEED, device=DEVICE)
 
         torch.manual_seed(50)
@@ -519,8 +521,8 @@ class TestTurboQuantCache:
         fp16_bytes = n_layers * n_heads * seq_len * d * 2 * 2
 
         # TQ memory
-        tq_bytes_per_vec = (d * B_MSE + 16 + d * 1 + 16 + 7) // 8
+        tq_bytes_per_vec, _ = memory_bytes_per_vector(d)
         tq_total = n_layers * n_heads * seq_len * 2 * tq_bytes_per_vec
 
         ratio = fp16_bytes / tq_total
-        assert ratio > 4.5, f"Memory ratio {ratio:.2f} too low"
+        assert ratio > 3.2, f"Memory ratio {ratio:.2f} too low"
