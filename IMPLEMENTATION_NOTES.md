@@ -1,66 +1,60 @@
-# TurboQuant — Implementation Notes for Codex
+# Implementation Notes
 
-## CRITICAL: Our PolarQuant is WRONG
+## Algorithm Choice: Scalar Quantization vs Recursive Polar Transform
 
-We implemented a simplified "Hadamard + scalar Lloyd-Max quantizer" instead of the REAL PolarQuant algorithm.
+This implementation follows **TurboQuant (arxiv 2504.19874)**, not PolarQuant (arxiv 2502.02617). While both papers share authors, they use fundamentally different approaches:
 
-### What the PolarQuant paper (arxiv 2502.02617) actually describes:
+**TurboQuant (what we implement):**
+- Random rotation → scalar Lloyd-Max quantization per coordinate
+- Each coordinate quantized independently — no coupling between dimensions
+- Errors do NOT compound through deep models
+- Provably within 2.7× of information-theoretic optimal (Theorem 1)
 
-1. **Random preconditioning**: Multiply by Gaussian random matrix S (i.i.d. N(0,1) entries), NOT Hadamard
-   - After preconditioning: S·x ~ N(0, ||x||² · I_m) — multivariate normal
-   - The paper uses Fact 3: for S with i.i.d. N(0,1) entries, S·x is multivariate normal
+**PolarQuant (what we DON'T implement):**
+- Random preconditioning → recursive polar transform → angle quantization
+- Coordinates coupled through sin/cos reconstruction tree (7 levels for d=128)
+- Errors compound multiplicatively through the reconstruction tree AND through transformer layers
+- Works well for shallow models but degrades on 32+ layer models
 
-2. **Recursive Polar Transformation** (the KEY innovation we missed):
-   - Pair up coordinates: (x1, x2) → (r, θ) where r = sqrt(x1² + x2²), θ = atan2(x2, x1)
-   - Then recursively pair up the radii from the previous level → more (r, θ) pairs
-   - For d=128: 64 angles at level 1, 32 at level 2, ..., 1 at the top = 127 total angles + 1 radius
-   - This is O(d) computation, very efficient
+## Random Rotation
 
-3. **Angle quantization** (NOT scalar coordinate quantization):
-   - After random preconditioning, the angles follow a CONCENTRATED distribution
-   - The distribution is analytically known (related to Beta distribution)
-   - Build optimal Lloyd-Max codebook for this known angle distribution
-   - Each angle quantized to b bits
-   - The radius at the top is stored separately (just one float16 per vector = the norm)
+We use the **Randomized Hadamard Transform** as the rotation matrix Π:
+1. Random sign flip: multiply each coordinate by ±1 (deterministic from seed)
+2. Fast Walsh-Hadamard Transform (FWHT): O(d log d) complexity
+3. Scale by 1/√d
 
-4. **Reconstruction**:
-   - Dequantize angles from codebook
-   - Recursively convert back from polar to Cartesian
-   - Multiply by inverse preconditioning matrix (S^T for Gaussian, or H^T for Hadamard)
-   - Scale by stored norm
+This is a practical approximation of the paper's random rotation matrix. The paper notes that any rotation satisfying P^T P = I works. The Hadamard approach is O(d log d) instead of O(d²) for a dense random matrix.
 
-### What we currently do (WRONG):
-1. Random sign flip + FWHT (Hadamard) — this is OK as an approximation of random preconditioning
-2. Scalar Lloyd-Max 2-bit quantization of EACH COORDINATE independently — THIS IS WRONG
-3. No polar transformation at all
-4. Store norm + 2-bit indices per coordinate
+After rotation, each coordinate of Π·x follows a Beta distribution that converges to N(0, 1/d) for d ≥ 64 (Lemma 1). Critically, distinct coordinates become **near-independent** in high dimensions, which is why scalar quantization per coordinate is near-optimal.
 
-### Why this matters:
-- Polar quantization of angles is MORE EFFICIENT than scalar coordinate quantization
-- The angles after preconditioning are tightly concentrated → fewer bits needed
-- Scalar quantization wastes bits on the magnitude information (which is redundant since we store the norm)
-- The paper achieves 4.2x compression with near-zero quality loss; we get 4.9x but with 0.92 cosine sim
+## Lloyd-Max Codebook
 
-### The TurboQuant algorithm (arxiv 2504.19874) combines:
-- Stage 1: PolarQuant (REAL polar coordinates, 2-3 bits per angle)
-- Stage 2: QJL (1-bit residual correction)
-- The paper says 3.5 bits total — that's ~2.5 bits for PolarQuant + 1 bit for QJL
+The scalar codebook is computed by solving the continuous 1D k-means problem (Eq. 3) for the Beta distribution f_X(x) = Γ(d/2) / (√π · Γ((d-1)/2)) · (1-x²)^((d-3)/2).
 
-### What needs to change:
-1. Implement recursive polar transformation: Cartesian → (angles, radius)
-2. Implement inverse polar transformation: (angles, radius) → Cartesian  
-3. Compute angle distribution after preconditioning (concentrated Beta-like)
-4. Build Lloyd-Max codebook for the ANGLE distribution (not coordinate distribution)
-5. Encode: precondition → polar transform → quantize angles → store angles + norm
-6. Decode: dequantize angles → inverse polar → inverse precondition → scale by norm
-7. Update attention kernel to work with polar-encoded keys
+For d ≥ 64, we use the Gaussian approximation N(0, 1/d) which is faster and equally accurate. Optimal centroids for common bit widths:
+- b=1: {±√(2/(πd))}
+- b=2: {±0.453/√d, ±1.51/√d}
 
-### Reference:
-- PolarQuant paper: https://arxiv.org/html/2502.02617v1 (Section 3.1: Recursive Polar Transformation)
-- TurboQuant paper: https://arxiv.org/abs/2504.19874
-- QJL reference code: https://github.com/amirzandieh/QJL
+The **same codebook** is used for all coordinates — no per-level or per-channel variation needed.
 
-### Practical note on preconditioning:
-The paper uses Gaussian S but notes that randomized Hadamard (sign flip + FWHT) is a practical 
-approximation that's O(d log d) instead of O(d²). Our Hadamard preconditioning is fine — the 
-polar transformation is what we're missing.
+## QJL Residual Correction
+
+The QJL (Quantized Johnson-Lindenstrauss) stage provides unbiased inner product estimation:
+1. Compute residual: r = x - DeQuant_mse(Quant_mse(x))
+2. Project: sign(S · r) where S is a random matrix
+3. Store: 1-bit signs + FP16 residual norm
+4. Reconstruct: x̂_qjl = √(π/2)/d · ‖r‖ · S^T · signs
+
+We use Rademacher (±1) entries for S instead of Gaussian N(0,1) for efficiency. Both satisfy the JL property; Rademacher avoids storing floating-point matrix entries.
+
+## Outlier Channel Handling
+
+The paper's 2.5-bit and 3.5-bit modes (Table 1) allocate more bits to outlier channels:
+- 2.5-bit: 32 outlier channels at 3 bits + 96 regular at 2 bits
+- 3.5-bit: similar split with higher bit allocation
+
+This is conceptually similar to "attention sinks" — certain channels carry disproportionate information. Currently our implementation uses uniform bit allocation; mixed-precision channel allocation is planned.
+
+## Backward Compatibility
+
+The public API uses names like `PolarQuantCompressed` and `polarquant_encode/decode` for backward compatibility with existing code that imports these. Internally, these now implement scalar per-coordinate quantization (TurboQuant Algorithm 1), not recursive polar transform.

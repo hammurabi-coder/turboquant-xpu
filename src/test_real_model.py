@@ -95,12 +95,14 @@ def compress_decompress_kv(
                 k_recon = polarquant_decode(k_compressed.pq)
                 v_recon = polarquant_decode(v_compressed.pq)
 
-            # Trim to actual head_dim if padded
-            if k_recon.shape[-1] != head_dim:
-                k_recon = k_recon[..., :head_dim]
-                v_recon = v_recon[..., :head_dim]
-            new_k[:, head_idx] = k_recon.reshape(batch, seq_len, head_dim).to(k.dtype)
-            new_v[:, head_idx] = v_recon.reshape(batch, seq_len, head_dim).to(v.dtype)
+            # Trim to actual head_dim if padded and reshape
+            k_flat_recon = k_recon.reshape(-1, k_recon.shape[-1])
+            v_flat_recon = v_recon.reshape(-1, v_recon.shape[-1])
+            if k_flat_recon.shape[-1] != head_dim:
+                k_flat_recon = k_flat_recon[..., :head_dim]
+                v_flat_recon = v_flat_recon[..., :head_dim]
+            new_k[:, head_idx] = k_flat_recon.reshape(batch, seq_len, head_dim).to(k.dtype)
+            new_v[:, head_idx] = v_flat_recon.reshape(batch, seq_len, head_dim).to(v.dtype)
 
         new_past.append((new_k, new_v))
 
