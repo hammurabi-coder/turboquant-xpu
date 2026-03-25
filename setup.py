@@ -18,11 +18,11 @@ if readme_path.exists():
     long_description = readme_path.read_text(encoding="utf-8")
 
 setup(
-    name="turboquant-vllm-plugin",
+    name="turboquant",
     version="0.1.0",
     description=(
-        "TurboQuant: low-bit KV cache compression for vLLM — "
-        "PolarQuant + QJL with near-zero accuracy loss"
+        "TurboQuant: near-optimal KV cache compression for LLM inference — "
+        "5x compression with near-zero quality loss (ICLR 2026)"
     ),
     long_description=long_description,
     long_description_content_type="text/markdown",
