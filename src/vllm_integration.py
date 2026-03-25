@@ -273,7 +273,7 @@ class TurboQuantKVManager:
         # --- Case 1: Only compressed tokens ---
         if n_buffered == 0:
             return self._tq_cache.compute_attention(
-                layer_idx, kv_head_idx, q_f, causal=causal
+                layer_idx, kv_head_idx, q_f
             )
 
         # --- Case 2: Only buffered (raw) tokens ---
@@ -487,7 +487,7 @@ class TurboQuantAttentionWrapper:
                     for t in range(seq_q):
                         q_vec = query[b, t, q_h, :].float()
                         out = self.kv_manager.fetch(
-                            self.layer_idx, kv_h, q_vec, causal=True
+                            self.layer_idx, kv_h, q_vec
                         )
                         outputs[b, t, q_h, :] = out.to(query.dtype)
 
@@ -518,7 +518,7 @@ class TurboQuantAttentionWrapper:
                     q_h = kv_h * heads_per_kv + q_off
                     q_vec = query[b, 0, q_h, :].float()
                     out = self.kv_manager.fetch(
-                        self.layer_idx, kv_h, q_vec, causal=True
+                        self.layer_idx, kv_h, q_vec
                     )
                     outputs[b, 0, q_h, :] = out.to(query.dtype)
 
@@ -758,7 +758,7 @@ if __name__ == "__main__":
     print(f"\n--- Computing attention (decode step) ---")
     for kv_h in range(config.num_kv_heads):
         q_vec = torch.randn(config.head_dim)
-        out = kv_mgr.fetch(0, kv_h, q_vec, causal=True)
+        out = kv_mgr.fetch(0, kv_h, q_vec)
         print(f"  KV head {kv_h}: output norm = {out.norm().item():.4f}")
 
     # --- GQA broadcast test ---

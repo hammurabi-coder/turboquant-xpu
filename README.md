@@ -8,7 +8,7 @@
 
 **Compress your LLM's KV cache by 5× with near-zero accuracy loss.** Run longer contexts, serve more users, use less GPU memory.
 
-> First open-source implementation of [Google's TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026). 3.5 bits/value = identical quality to FP16. Provably within 2.7× of information-theoretic optimal.
+> First open-source implementation of [Google's TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026). 3.5 bits/value = near-identical quality to FP16. Provably within 2.7× of information-theoretic optimal.
 
 ## Why TurboQuant?
 

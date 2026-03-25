@@ -355,9 +355,13 @@ def detect_outlier_channels(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Identify outlier channels by variance after rotation.
 
-    Channels with highest variance benefit most from extra bits.
-    This is consistent with prior work on outlier-aware quantization
-    (Zandieh et al. 2024, Su et al. 2025) cited in Section 2.3.
+    NOTE: This is an approximation of the paper's Section 2.3, which
+    describes applying two independent TurboQuant instances to separate
+    channel subsets with separate rotations. Our implementation applies
+    a single rotation and detects variance outliers post-rotation, then
+    assigns different codebook bit budgets. This provides some benefit
+    from residual variance inhomogeneity in the Hadamard approximation,
+    but is not the theoretically optimal approach described in the paper.
 
     Args:
         y_rotated: [N, d] rotated vectors
@@ -830,9 +834,15 @@ class TurboQuantCache:
 
     def compute_attention(
         self, layer_idx: int, head_idx: int, q_vec: torch.Tensor,
-        qjl_score_weight: float = 0.5,
+        qjl_score_weight: float = 1.0,
     ) -> torch.Tensor:
         """Compute attention output using compressed KV cache.
+
+        Args:
+            qjl_score_weight: Weight for QJL inner product correction.
+                1.0 = paper-correct unbiased estimator (Theorem 2).
+                <1.0 = bias-variance tradeoff (lower variance, introduces bias).
+                0.0 = PolarQuant-only scoring (no QJL correction).
 
         Note: Causal masking is not yet implemented. All stored KV tokens
         are attended to. For autoregressive generation, this is correct

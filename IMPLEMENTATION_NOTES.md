@@ -53,7 +53,13 @@ The paper's 2.5-bit and 3.5-bit modes (Table 1) allocate more bits to outlier ch
 - 2.5-bit: 32 outlier channels at 3 bits + 96 regular at 2 bits
 - 3.5-bit: similar split with higher bit allocation
 
-This is conceptually similar to "attention sinks" — certain channels carry disproportionate information. Currently our implementation uses uniform bit allocation; mixed-precision channel allocation is planned.
+**Paper approach (Section 2.3):** Split channels into outlier/regular sets, apply two **independent** TurboQuant instances with separate rotations and codebooks to each subset.
+
+**Our approximation:** We apply a single rotation over all dimensions, then detect high-variance channels post-rotation and assign different codebook bit budgets. This provides some benefit from residual variance inhomogeneity in the Hadamard approximation, but is not the theoretically optimal two-independent-instances approach described in the paper. The full paper approach requires separate Hadamard matrices for each subset, which we plan to implement in a future version.
+
+## QJL Score Weight
+
+The `compute_attention()` method defaults to `qjl_score_weight=1.0`, which produces the paper-correct **unbiased** inner product estimator (Theorem 2). Setting `qjl_score_weight < 1.0` trades bias for lower variance — this is a practical heuristic not present in the paper that can improve attention quality when the QJL variance is high relative to score differences.
 
 ## Backward Compatibility
 

@@ -154,7 +154,7 @@ def main():
 
         # TurboQuant attention
         t0 = time.perf_counter()
-        tq_out = cache.compute_attention(layer, head, q, causal=False)
+        tq_out = cache.compute_attention(layer, head, q, )
         tq_time = time.perf_counter() - t0
         tq_times.append(tq_time)
 
