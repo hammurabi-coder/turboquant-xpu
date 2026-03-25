@@ -98,23 +98,37 @@ class RandomHadamardRotation:
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply random rotation: Π · x."""
-        y = x * self.signs
-        fwht_inplace(y)
-        y = y / self.sqrt_d
+        signs = self.signs.to(device=x.device, dtype=x.dtype)
+        y = x * signs
+        # FWHT requires power-of-2 dimensions
+        if self.d & (self.d - 1) == 0:
+            fwht_inplace(y)
+            y = y / self.sqrt_d
         return y
 
     def inverse(self, y: torch.Tensor) -> torch.Tensor:
         """Apply inverse rotation: Π^T · y = D ⊙ ((1/√d) · H · y)."""
         z = y.clone()
-        fwht_inplace(z)
-        z = z / self.sqrt_d
-        z = z * self.signs
+        if self.d & (self.d - 1) == 0:
+            fwht_inplace(z)
+            z = z / self.sqrt_d
+        z = z * self.signs.to(device=z.device, dtype=z.dtype)
         return z
 
 
 # ---------------------------------------------------------------------------
 # Recursive polar transform helpers
 # ---------------------------------------------------------------------------
+
+def _next_power_of_two(n: int) -> int:
+    """Return the smallest power of 2 >= n."""
+    if n <= 0:
+        return 1
+    p = 1
+    while p < n:
+        p *= 2
+    return p
+
 
 def _require_power_of_two(d: int) -> None:
     if d <= 0 or d & (d - 1):
@@ -425,10 +439,20 @@ def polarquant_encode(x: torch.Tensor, codebook: Codebook, rotation: RandomHadam
     if x.dim() == 1:
         x = x.unsqueeze(0)
 
+    x = x.detach().float()
+    
     norm = x.norm(dim=-1).to(torch.float16)
     zero_mask = norm < EPS
 
-    x_rotated = rotation.forward(x.float())
+    # Pad to power-of-2 BEFORE rotation if needed
+    d_actual = x.shape[-1]
+    d_padded = _next_power_of_two(d_actual)
+    if d_padded != d_actual:
+        padding = torch.zeros(*x.shape[:-1], d_padded - d_actual,
+                              device=x.device, dtype=x.dtype)
+        x = torch.cat([x, padding], dim=-1)
+
+    x_rotated = rotation.forward(x)
     angles, _ = recursive_polar_transform(x_rotated)
     indices = codebook.quantize(angles)
 
@@ -443,7 +467,14 @@ def polarquant_decode(c: PolarQuantCompressed) -> torch.Tensor:
     angles_hat = c.codebook.dequantize(c.indices)
     radius = c.norm.float().unsqueeze(-1)
     x_rotated_hat = inverse_polar_transform(angles_hat, radius)
+    
+    # Inverse rotation first (on padded dimension), then unpad
     x_hat = c.rotation.inverse(x_rotated_hat)
+    
+    # Unpad if the original dimension wasn't a power of 2
+    d_actual = c.codebook.d
+    if x_hat.shape[-1] > d_actual:
+        x_hat = x_hat[..., :d_actual]
 
     zero_mask = c.norm < EPS
     if zero_mask.any():
@@ -503,17 +534,20 @@ class TurboQuantConfig:
 
     def __init__(self, d: int = 128, b_mse: int = B_MSE, device: torch.device = torch.device("cpu")):
         self.d = d
+        self.d_padded = _next_power_of_two(d)
         self.b_mse = b_mse
         self.device = device
-        self.codebook = compute_lloyd_max_codebook(d, b_mse, device=device)
+        # Codebook uses padded dimension for polar transform, but stores actual d
+        self.codebook = compute_lloyd_max_codebook(self.d_padded, b_mse, device=device)
+        self.codebook.d = d  # track actual dimension for unpadding
 
     def make_rotation(self, layer_idx: int, head_idx: int) -> RandomHadamardRotation:
-        # Deterministic seed independent of PYTHONHASHSEED
+        # Use padded dimension — input is padded before rotation in polarquant_encode
         seed = ((layer_idx * 1000003) ^ (head_idx * 999979) ^ 0xA5A5A5A5) & 0xFFFFFFFF
-        return RandomHadamardRotation(self.d, seed, self.device)
+        return RandomHadamardRotation(self.d_padded, seed, self.device)
 
     def make_qjl_matrix(self, layer_idx: int, head_idx: int) -> torch.Tensor:
-        # Deterministic seed independent of PYTHONHASHSEED
+        # QJL operates on actual dimension (not padded) — residual is in original space
         seed = ((layer_idx * 1000003) ^ (head_idx * 999979) ^ 0x5A5A5A5A) & 0xFFFFFFFF
         return generate_qjl_matrix(self.d, seed, self.device)
 
@@ -529,8 +563,13 @@ def turboquant_encode_internal(
         x = x.unsqueeze(0)
 
     pq = polarquant_encode(x, codebook, rotation)
-    x_hat = polarquant_decode(pq)
-    residual = x - x_hat
+    x_hat = polarquant_decode(pq).float()
+    
+    # x_hat is unpadded (d_actual), match it for residual
+    x_for_residual = x.detach().float()
+    if x_for_residual.shape[-1] != x_hat.shape[-1]:
+        x_for_residual = x_for_residual[..., :x_hat.shape[-1]]
+    residual = x_for_residual - x_hat
     qjl = qjl_encode(residual, S)
 
     return TurboQuantCompressed(pq=pq, qjl=qjl)
