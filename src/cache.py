@@ -201,10 +201,15 @@ def compute_lloyd_max_codebook(
 # ---------------------------------------------------------------------------
 
 def generate_qjl_matrix(d: int, seed: int, device: torch.device = torch.device("cpu")) -> torch.Tensor:
-    """Generate the QJL random Gaussian matrix S ∈ ℝ^{d×d}."""
+    """Generate the QJL random Rademacher matrix S ∈ {-1, +1}^{d×d}.
+    
+    The QJL algorithm requires a Rademacher (±1) random matrix, not Gaussian.
+    Rademacher matrices satisfy the Johnson-Lindenstrauss property and produce
+    lower-variance single-sample inner product estimates than Gaussian matrices.
+    """
     g = torch.Generator(device=device)
     g.manual_seed(seed)
-    return torch.randn(d, d, generator=g, device=device, dtype=torch.float32)
+    return torch.randint(0, 2, (d, d), generator=g, device=device).float() * 2 - 1
 
 
 # ---------------------------------------------------------------------------
