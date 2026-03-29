@@ -42,7 +42,7 @@ from cache import (
 # Fixtures
 # ---------------------------------------------------------------------------
 
-DEVICE = torch.device("cpu")
+DEVICE = torch.device(os.getenv("DEVICE", "xpu"))
 D = 128
 SEED = 42
 BATCH = 8

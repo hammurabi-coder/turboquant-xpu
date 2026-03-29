@@ -1,3 +1,9 @@
+# NOTE: tl.gather has a materialization bug on the Triton XPU backend
+# (Intel Arc B580) — gather results are incorrectly zero when stored to a
+# register variable before use in tl.where. Using the pure-PyTorch fallback
+# path (fwht, polarquant_encode, polarquant_decode) on XPU. Triton kernel
+# port is tracked as a follow-up issue.
+
 """
 TurboQuant KV Cache Compression — Pure PyTorch Implementation
 
