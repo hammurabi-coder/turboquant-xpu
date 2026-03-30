@@ -623,16 +623,27 @@ def polarquant_decode(c: PolarQuantCompressed) -> torch.Tensor:
 
 @dataclass
 class QJLCompressed:
-    """Compressed representation from QJL (1-bit per coord + residual norm)."""
+    """Compressed representation from QJL (1-bit per coord + residual norm).
+
+    S is NOT stored — it is deterministically regenerated from seed on demand,
+    exactly like RandomHadamardRotation signs. Storing S would be d×d float32
+    (64KB per head) vs 1 bit per coordinate for the true compression ratio.
+    """
     signs: torch.Tensor       # [batch, d] in {0, 1}
     r_norm: torch.Tensor     # [batch] residual norm
     seed: int                 # seed for regenerating S on demand
     device: torch.device = torch.device("cpu")
-    S: torch.Tensor = None   # [d, d] stored S matrix (needed for attention correction)
 
     @property
     def d(self) -> int:
         return self.signs.shape[-1]
+
+    @property
+    def S(self) -> torch.Tensor:
+        """Regenerate S matrix on demand from seed (deterministic)."""
+        g = torch.Generator(device=self.device)
+        g.manual_seed(self.seed)
+        return torch.randn(self.d, self.d, generator=g, device=self.device)
 
 
 def qjl_encode(residual: torch.Tensor, S: torch.Tensor, seed: int) -> QJLCompressed:
@@ -641,8 +652,7 @@ def qjl_encode(residual: torch.Tensor, S: torch.Tensor, seed: int) -> QJLCompres
     Args:
         residual: residual vector after PQ stage
         S: d×d random Gaussian matrix (used for sign projection, not stored)
-        seed: integer seed for regenerating S on decode — S must be regenerated
-              from the same seed so the sign pattern matches exactly
+        seed: integer seed for regenerating S on decode
     """
     if residual.dim() == 1:
         residual = residual.unsqueeze(0)
@@ -654,7 +664,7 @@ def qjl_encode(residual: torch.Tensor, S: torch.Tensor, seed: int) -> QJLCompres
     projected = r_unit @ S.T
     signs = (projected >= 0).to(torch.uint8)  # binary 0/1 — uint8, NOT int64
 
-    return QJLCompressed(signs=signs, r_norm=r_norm, seed=seed, device=S.device, S=S)
+    return QJLCompressed(signs=signs, r_norm=r_norm, seed=seed, device=S.device)
 
 
 # ---------------------------------------------------------------------------
@@ -1217,6 +1227,11 @@ def turboquant_attention(
             # PQ-only scoring achieves 0.76 cos_sim (seq_k=16, D=128).
             # This tradeoff reverses at longer seq_k (1024+) where softmax
             # is softer and ranking is more robust to noise.
+            # TODO: when enabling QJL correction, S must be stored in
+            # QJLCompressed during encode (or regenerated via
+            # config.make_qjl_matrix(layer, head)) — the S property
+            # regenerates from seed but produces a different matrix than
+            # the one used during encoding due to generator state.
             # if ck.qjl is not None:
             #     S = ck.qjl.S
             #     q_proj = q_rot @ S
