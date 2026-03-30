@@ -623,37 +623,20 @@ def polarquant_decode(c: PolarQuantCompressed) -> torch.Tensor:
 
 @dataclass
 class QJLCompressed:
-    """Compressed representation from QJL (1-bit per coord + residual norm).
-
-    S is NOT stored — it is deterministically regenerated from seed on demand,
-    exactly like RandomHadamardRotation signs. Storing S would be d×d float32
-    (64KB per head) vs 1 bit per coordinate for the true compression ratio.
-    """
+    """Compressed representation from QJL (1-bit per coord + residual norm)."""
     signs: torch.Tensor       # [batch, d] in {0, 1}
     r_norm: torch.Tensor     # [batch] residual norm
-    seed: int                 # seed for regenerating S on demand
+    S: torch.Tensor          # [d, d] stored S matrix (for attention correction)
+    seed: int = 0            # seed (for reproducibility, S is stored directly)
     device: torch.device = torch.device("cpu")
 
     @property
     def d(self) -> int:
         return self.signs.shape[-1]
 
-    @property
-    def S(self) -> torch.Tensor:
-        """Regenerate S matrix on demand from seed (deterministic)."""
-        g = torch.Generator(device=self.device)
-        g.manual_seed(self.seed)
-        return torch.randn(self.d, self.d, generator=g, device=self.device)
 
-
-def qjl_encode(residual: torch.Tensor, S: torch.Tensor, seed: int) -> QJLCompressed:
-    """QJL encode (Algorithm 2, line 7): qjl = sign(S · r).
-
-    Args:
-        residual: residual vector after PQ stage
-        S: d×d random Gaussian matrix (used for sign projection, not stored)
-        seed: integer seed for regenerating S on decode
-    """
+def qjl_encode(residual: torch.Tensor, S: torch.Tensor) -> QJLCompressed:
+    """QJL encode (Algorithm 2, line 7): qjl = sign(S · r)."""
     if residual.dim() == 1:
         residual = residual.unsqueeze(0)
 
@@ -664,7 +647,7 @@ def qjl_encode(residual: torch.Tensor, S: torch.Tensor, seed: int) -> QJLCompres
     projected = r_unit @ S.T
     signs = (projected >= 0).to(torch.uint8)  # binary 0/1 — uint8, NOT int64
 
-    return QJLCompressed(signs=signs, r_norm=r_norm, seed=seed, device=S.device)
+    return QJLCompressed(signs=signs, r_norm=r_norm, S=S, device=S.device)
 
 
 # ---------------------------------------------------------------------------
@@ -828,17 +811,12 @@ def turboquant_encode_internal(
     codebook: Codebook,
     rotation: RandomHadamardRotation,
     S: torch.Tensor,
-    S_seed: int,
     mixed: Optional[MixedPrecisionConfig] = None,
 ) -> TurboQuantCompressed:
     """Full TurboQuant encode (Algorithm 2):
     1. MSE-optimal quantization (with optional mixed precision)
     2. Compute residual
     3. QJL 1-bit quantization of residual
-
-    Args:
-        S_seed: integer seed for the QJL matrix. The S matrix itself is NOT
-                stored — only the seed, which allows exact regeneration.
     """
     if x.dim() == 1:
         x = x.unsqueeze(0)
@@ -851,7 +829,7 @@ def turboquant_encode_internal(
     if x_for_residual.shape[-1] != x_hat.shape[-1]:
         x_for_residual = x_for_residual[..., :x_hat.shape[-1]]
     residual = x_for_residual - x_hat
-    qjl = qjl_encode(residual, S, seed=S_seed)
+    qjl = qjl_encode(residual, S)
 
     return TurboQuantCompressed(pq=pq, qjl=qjl)
 
@@ -945,8 +923,8 @@ class TurboQuantCache:
         if self.config.mixed_precision:
             mixed = self._get_mixed_config(layer_idx, head_idx, k_vec)
 
-        k_c = turboquant_encode_internal(k_vec, self.config.codebook, rotation, S, S_seed, mixed=mixed)
-        v_c = turboquant_encode_internal(v_vec, self.config.codebook, rotation, S, S_seed, mixed=mixed)
+        k_c = turboquant_encode_internal(k_vec, self.config.codebook, rotation, S, mixed=mixed)
+        v_c = turboquant_encode_internal(v_vec, self.config.codebook, rotation, S, mixed=mixed)
         self.cache[layer_idx][head_idx].append((k_c, v_c))
 
     def store_batch(self, layer_idx: int, head_idx: int, k_vecs: torch.Tensor, v_vecs: torch.Tensor):
@@ -959,8 +937,8 @@ class TurboQuantCache:
         if self.config.mixed_precision:
             mixed = self._get_mixed_config(layer_idx, head_idx, k_vecs)
 
-        k_all = turboquant_encode_internal(k_vecs, self.config.codebook, rotation, S, S_seed, mixed=mixed)
-        v_all = turboquant_encode_internal(v_vecs, self.config.codebook, rotation, S, S_seed, mixed=mixed)
+        k_all = turboquant_encode_internal(k_vecs, self.config.codebook, rotation, S, mixed=mixed)
+        v_all = turboquant_encode_internal(v_vecs, self.config.codebook, rotation, S, mixed=mixed)
 
         for i in range(k_vecs.shape[0]):
             k_single = TurboQuantCompressed(
@@ -983,7 +961,7 @@ class TurboQuantCache:
                 ),
                 qjl=QJLCompressed(
                     signs=k_all.qjl.signs[i:i+1], r_norm=k_all.qjl.r_norm[i:i+1],
-                    seed=S_seed, device=self.device,
+                    S=k_all.qjl.S, seed=S_seed, device=self.device,
                 ),
             )
             v_single = TurboQuantCompressed(
@@ -1006,7 +984,7 @@ class TurboQuantCache:
                 ),
                 qjl=QJLCompressed(
                     signs=v_all.qjl.signs[i:i+1], r_norm=v_all.qjl.r_norm[i:i+1],
-                    seed=S_seed, device=self.device,
+                    S=v_all.qjl.S, seed=S_seed, device=self.device,
                 ),
             )
             self.cache[layer_idx][head_idx].append((k_single, v_single))
