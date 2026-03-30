@@ -455,6 +455,14 @@ class PolarQuantCompressed:
     rotation_outlier: Optional[RandomHadamardRotation] = None
 
     @property
+    def padded_d(self) -> int:
+        """Padded dimension (next multiple of codebook.K)."""
+        if self.codebook is None:
+            return 0
+        cb_size = self.codebook.K
+        return ((self.d + cb_size - 1) // cb_size) * cb_size
+
+    @property
     def d(self) -> int:
         if self.original_dim:
             return self.original_dim
@@ -615,18 +623,39 @@ def polarquant_decode(c: PolarQuantCompressed) -> torch.Tensor:
 
 @dataclass
 class QJLCompressed:
-    """Compressed representation from QJL (1-bit per coord + residual norm)."""
+    """Compressed representation from QJL (1-bit per coord + residual norm).
+
+    S is NOT stored — it is deterministically regenerated from seed,
+    exactly like RandomHadamardRotation signs. This is critical:
+    storing S would make the compressed representation larger than FP16
+    (d×d float32 = 64KB per head vs 128×3 bits = 48 bytes for the true compression).
+    """
     signs: torch.Tensor       # [batch, d] in {0, 1}
     r_norm: torch.Tensor      # [batch] residual norm
-    S: torch.Tensor           # [d, d] random Gaussian matrix
+    seed: int                 # seed for regenerating S on demand
+    device: torch.device = torch.device("cpu")
 
     @property
     def d(self) -> int:
         return self.signs.shape[-1]
 
+    @property
+    def S(self) -> torch.Tensor:
+        """Regenerate S matrix on demand from seed (deterministic)."""
+        g = torch.Generator(device=self.device)
+        g.manual_seed(self.seed)
+        return torch.randn(self.d, self.d, generator=g, device=self.device)
 
-def qjl_encode(residual: torch.Tensor, S: torch.Tensor) -> QJLCompressed:
-    """QJL encode (Algorithm 2, line 7): qjl = sign(S · r)."""
+
+def qjl_encode(residual: torch.Tensor, S: torch.Tensor, seed: int) -> QJLCompressed:
+    """QJL encode (Algorithm 2, line 7): qjl = sign(S · r).
+
+    Args:
+        residual: residual vector after PQ stage
+        S: d×d random Gaussian matrix (used for sign projection, not stored)
+        seed: integer seed for regenerating S on decode — S must be regenerated
+              from the same seed so the sign pattern matches exactly
+    """
     if residual.dim() == 1:
         residual = residual.unsqueeze(0)
 
@@ -635,9 +664,9 @@ def qjl_encode(residual: torch.Tensor, S: torch.Tensor) -> QJLCompressed:
     r_unit = residual / safe_norm.unsqueeze(-1)
 
     projected = r_unit @ S.T
-    signs = (projected >= 0).long()
+    signs = (projected >= 0).to(torch.uint8)  # binary 0/1 — uint8, NOT int64
 
-    return QJLCompressed(signs=signs, r_norm=r_norm, S=S)
+    return QJLCompressed(signs=signs, r_norm=r_norm, seed=seed, device=S.device)
 
 
 # ---------------------------------------------------------------------------
@@ -801,12 +830,17 @@ def turboquant_encode_internal(
     codebook: Codebook,
     rotation: RandomHadamardRotation,
     S: torch.Tensor,
+    S_seed: int,
     mixed: Optional[MixedPrecisionConfig] = None,
 ) -> TurboQuantCompressed:
     """Full TurboQuant encode (Algorithm 2):
     1. MSE-optimal quantization (with optional mixed precision)
     2. Compute residual
     3. QJL 1-bit quantization of residual
+
+    Args:
+        S_seed: integer seed for the QJL matrix. The S matrix itself is NOT
+                stored — only the seed, which allows exact regeneration.
     """
     if x.dim() == 1:
         x = x.unsqueeze(0)
@@ -819,7 +853,7 @@ def turboquant_encode_internal(
     if x_for_residual.shape[-1] != x_hat.shape[-1]:
         x_for_residual = x_for_residual[..., :x_hat.shape[-1]]
     residual = x_for_residual - x_hat
-    qjl = qjl_encode(residual, S)
+    qjl = qjl_encode(residual, S, seed=S_seed)
 
     return TurboQuantCompressed(pq=pq, qjl=qjl)
 
@@ -875,11 +909,15 @@ class TurboQuantCache:
 
         self.rotations: List[List[RandomHadamardRotation]] = []
         self.qjl_matrices: List[List[torch.Tensor]] = []
+        self.qjl_seeds: List[List[int]] = []  # store seeds so S is never serialized
         for l in range(n_layers):
             self.rotations.append([])
             self.qjl_matrices.append([])
+            self.qjl_seeds.append([])
             for h in range(n_heads):
                 self.rotations[l].append(self.config.make_rotation(l, h))
+                seed = ((l * 1000003) ^ (h * 999979) ^ 0x5A5A5A5A) & 0xFFFFFFFF
+                self.qjl_seeds[l].append(seed)
                 self.qjl_matrices[l].append(self.config.make_qjl_matrix(l, h))
 
         self.cache: List[List[List[Tuple[TurboQuantCompressed, TurboQuantCompressed]]]] = []
@@ -902,27 +940,29 @@ class TurboQuantCache:
     def store(self, layer_idx: int, head_idx: int, k_vec: torch.Tensor, v_vec: torch.Tensor):
         rotation = self.rotations[layer_idx][head_idx]
         S = self.qjl_matrices[layer_idx][head_idx]
+        S_seed = self.qjl_seeds[layer_idx][head_idx]
 
         # For mixed precision, detect outliers from the first store
         mixed = None
         if self.config.mixed_precision:
             mixed = self._get_mixed_config(layer_idx, head_idx, k_vec)
 
-        k_c = turboquant_encode_internal(k_vec, self.config.codebook, rotation, S, mixed=mixed)
-        v_c = turboquant_encode_internal(v_vec, self.config.codebook, rotation, S, mixed=mixed)
+        k_c = turboquant_encode_internal(k_vec, self.config.codebook, rotation, S, S_seed, mixed=mixed)
+        v_c = turboquant_encode_internal(v_vec, self.config.codebook, rotation, S, S_seed, mixed=mixed)
         self.cache[layer_idx][head_idx].append((k_c, v_c))
 
     def store_batch(self, layer_idx: int, head_idx: int, k_vecs: torch.Tensor, v_vecs: torch.Tensor):
         rotation = self.rotations[layer_idx][head_idx]
         S = self.qjl_matrices[layer_idx][head_idx]
+        S_seed = self.qjl_seeds[layer_idx][head_idx]
 
         # Detect outliers from the batch
         mixed = None
         if self.config.mixed_precision:
             mixed = self._get_mixed_config(layer_idx, head_idx, k_vecs)
 
-        k_all = turboquant_encode_internal(k_vecs, self.config.codebook, rotation, S, mixed=mixed)
-        v_all = turboquant_encode_internal(v_vecs, self.config.codebook, rotation, S, mixed=mixed)
+        k_all = turboquant_encode_internal(k_vecs, self.config.codebook, rotation, S, S_seed, mixed=mixed)
+        v_all = turboquant_encode_internal(v_vecs, self.config.codebook, rotation, S, S_seed, mixed=mixed)
 
         for i in range(k_vecs.shape[0]):
             k_single = TurboQuantCompressed(
@@ -944,7 +984,8 @@ class TurboQuantCache:
                     rotation_outlier=k_all.pq.rotation_outlier,
                 ),
                 qjl=QJLCompressed(
-                    signs=k_all.qjl.signs[i:i+1], r_norm=k_all.qjl.r_norm[i:i+1], S=S,
+                    signs=k_all.qjl.signs[i:i+1], r_norm=k_all.qjl.r_norm[i:i+1],
+                    seed=S_seed, device=self.device,
                 ),
             )
             v_single = TurboQuantCompressed(
@@ -966,7 +1007,8 @@ class TurboQuantCache:
                     rotation_outlier=v_all.pq.rotation_outlier,
                 ),
                 qjl=QJLCompressed(
-                    signs=v_all.qjl.signs[i:i+1], r_norm=v_all.qjl.r_norm[i:i+1], S=S,
+                    signs=v_all.qjl.signs[i:i+1], r_norm=v_all.qjl.r_norm[i:i+1],
+                    seed=S_seed, device=self.device,
                 ),
             )
             self.cache[layer_idx][head_idx].append((k_single, v_single))
@@ -1143,6 +1185,83 @@ def memory_bytes_per_vector(
     fp16_bytes = d * 2
     return tq_bytes, fp16_bytes
 
+
+# -----------------------------------------------------------------------------
+# Asymmetric Attention — compute attention directly from compressed KV
+# -----------------------------------------------------------------------------
+
+def turboquant_attention(
+    q: torch.Tensor,           # [batch, heads, 1, head_dim]  (decode step)
+    compressed_k: list,        # list[list[TurboQuantCompressed]]  [batch][head]
+    compressed_v: list,
+    config: "TurboQuantConfig",
+) -> torch.Tensor:
+    """
+    Asymmetric attention: scores from compressed K, values
+    from decompressed V. No full K decompression needed.
+    q shape:  [B, H, 1, D]
+    output:   [B, H, 1, D]
+    """
+    B, H, _, D = q.shape
+    outputs = []
+    for b in range(B):
+        head_outputs = []
+        for h in range(H):
+            ck = compressed_k[b][h]   # TurboQuantCompressed
+            cv = compressed_v[b][h]
+
+            # Rotate q to match compressed K space
+            rot = config.make_rotation(0, h)
+            q_rot = rot.forward(q[b, h, 0])  # [D]
+
+            # Reconstruct approximate K via codebook lookup (no full decode)
+            # indices: [batch=1, seq_k, D] -> squeeze batch -> [seq_k, D]
+            k_indices = ck.pq.indices.squeeze(0)      # [seq_k, D]
+            k_approx = ck.pq.codebook.centroids[k_indices.long()]  # [seq_k, D]
+
+            # Attention scores: [seq_k, D] @ [D] -> [seq_k]
+            scale = D ** -0.5
+            scores = (k_approx @ q_rot) * scale
+            weights = torch.softmax(scores, dim=0)     # [seq_k]
+
+            # Decompress V for weighted sum: [1, seq_k, D] -> [seq_k, D]
+            v_full = polarquant_decode(cv.pq).squeeze(0)  # [seq_k, D]
+            # weights: [seq_k] -> [1, seq_k, 1] for broadcasting with v_full
+            out = (weights.unsqueeze(0).unsqueeze(-1) * v_full.unsqueeze(0)).sum(1)  # [1, D]
+            head_outputs.append(out.squeeze(0))         # [D]
+
+        outputs.append(torch.stack(head_outputs))  # [H, D]
+
+    return torch.stack(outputs).unsqueeze(2)  # [B, H, 1, D]
+
+
+def _get_rotated_padded_pq(pq: PolarQuantCompressed) -> torch.Tensor:
+    """Get the quantized rotated coordinates (Π·k) from a PolarQuantCompressed.
+
+    This is the PQ part of the compressed K without decoding to FP16.
+    We need this to compute q' · Q(k') directly.
+
+    Returns [batch, d_padded] tensor of quantized + rotated coordinates.
+    """
+    if pq.is_mixed_precision:
+        raise NotImplementedError(
+            "Asymmetric attention with mixed precision not yet implemented. "
+            "Use uniform precision mode."
+        )
+
+    # Dequantize indices to centroids (still in rotated space)
+    # indices: [..., 1, d] -> squeeze the 1 (sequence dim)
+    centroids = pq.codebook.centroids.to(device=pq.indices.device)
+    indices_squeezed = pq.indices.squeeze(-2)   # [..., d]
+    y_hat = centroids[indices_squeezed.long()]  # [..., d]
+
+    # Already rotated by Π — we just need to return y_hat
+    # (inverse rotation would undo Π, but we need Π·k for q'·k')
+    return y_hat
+
+# ---------------------------------------------------------------------------
+# TurboQuant MSE aliases (backward compatibility)
+# ---------------------------------------------------------------------------
 
 TurboQuantMSECompressed = PolarQuantCompressed
 turboquant_mse_encode = polarquant_encode
