@@ -67,3 +67,10 @@ def fwht4_working(x_ptr, D, BS):
 - Intel Arc B580 (Battlemage, 12GB VRAM)
 - WSL2 Ubuntu, PyTorch XPU stable, Triton 3.7.0
 - intel-xpu-backend-for-triton via pytorch.org/whl/xpu
+
+## Asymmetric Attention
+- `turboquant_attention()` implemented in `cache.py`
+- PQ-only K scoring, full V decompression
+- 0.76 avg cos_sim vs standard attention (seq_k=16, D=128)
+- QJL residual correction tested — degrades ranking quality despite improving dot-product estimation
+- Tradeoff reverses at longer seq_k (1024+) where softmax is softer

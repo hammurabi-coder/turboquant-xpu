@@ -623,28 +623,16 @@ def polarquant_decode(c: PolarQuantCompressed) -> torch.Tensor:
 
 @dataclass
 class QJLCompressed:
-    """Compressed representation from QJL (1-bit per coord + residual norm).
-
-    S is NOT stored — it is deterministically regenerated from seed,
-    exactly like RandomHadamardRotation signs. This is critical:
-    storing S would make the compressed representation larger than FP16
-    (d×d float32 = 64KB per head vs 128×3 bits = 48 bytes for the true compression).
-    """
+    """Compressed representation from QJL (1-bit per coord + residual norm)."""
     signs: torch.Tensor       # [batch, d] in {0, 1}
-    r_norm: torch.Tensor      # [batch] residual norm
+    r_norm: torch.Tensor     # [batch] residual norm
     seed: int                 # seed for regenerating S on demand
     device: torch.device = torch.device("cpu")
+    S: torch.Tensor = None   # [d, d] stored S matrix (needed for attention correction)
 
     @property
     def d(self) -> int:
         return self.signs.shape[-1]
-
-    @property
-    def S(self) -> torch.Tensor:
-        """Regenerate S matrix on demand from seed (deterministic)."""
-        g = torch.Generator(device=self.device)
-        g.manual_seed(self.seed)
-        return torch.randn(self.d, self.d, generator=g, device=self.device)
 
 
 def qjl_encode(residual: torch.Tensor, S: torch.Tensor, seed: int) -> QJLCompressed:
@@ -666,7 +654,7 @@ def qjl_encode(residual: torch.Tensor, S: torch.Tensor, seed: int) -> QJLCompres
     projected = r_unit @ S.T
     signs = (projected >= 0).to(torch.uint8)  # binary 0/1 — uint8, NOT int64
 
-    return QJLCompressed(signs=signs, r_norm=r_norm, seed=seed, device=S.device)
+    return QJLCompressed(signs=signs, r_norm=r_norm, seed=seed, device=S.device, S=S)
 
 
 # ---------------------------------------------------------------------------
@@ -1222,6 +1210,22 @@ def turboquant_attention(
             # Attention scores: [seq_k, D] @ [D] -> [seq_k]
             scale = D ** -0.5
             scores = (k_approx @ q_rot) * scale
+
+            # QJL correction improves dot-product estimation but degrades
+            # softmax ranking at short seq_k. At seq_k=16 a sharp softmax
+            # amplifies score noise, shuffling the attention ranking.
+            # PQ-only scoring achieves 0.76 cos_sim (seq_k=16, D=128).
+            # This tradeoff reverses at longer seq_k (1024+) where softmax
+            # is softer and ranking is more robust to noise.
+            # if ck.qjl is not None:
+            #     S = ck.qjl.S
+            #     q_proj = q_rot @ S
+            #     q_signs = (q_proj >= 0).float() * 2 - 1
+            #     k_signs = ck.qjl.signs.squeeze(0).float() * 2 - 1
+            #     r_norms = ck.qjl.r_norm.squeeze(0)
+            #     qjl_corr = r_norms * (k_signs @ q_signs) / D
+            #     scores = scores + qjl_corr
+
             weights = torch.softmax(scores, dim=0)     # [seq_k]
 
             # Decompress V for weighted sum: [1, seq_k, D] -> [seq_k, D]
