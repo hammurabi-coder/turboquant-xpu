@@ -1,13 +1,15 @@
 # ⚡ TurboQuant
 
-[![Tests](https://github.com/OnlyTerp/turboquant/actions/workflows/test.yml/badge.svg)](https://github.com/OnlyTerp/turboquant/actions)
+[![Tests](https://github.com/hammurabi-coder/turboquant-xpu/actions/workflows/test.yml/badge.svg)](https://github.com/hammurabi-coder/turboquant-xpu/actions)
 [![arXiv](https://img.shields.io/badge/arXiv-2504.19874-b31b1b.svg)](https://arxiv.org/abs/2504.19874)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.1+-ee4c2c.svg)](https://pytorch.org/)
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/OnlyTerp/turboquant/blob/master/notebooks/demo.ipynb)
 
 **Compress your LLM's KV cache by 5–7× with near-zero accuracy loss.** Run longer contexts, serve more users, use less GPU memory.
+
+## Intel Arc / XPU Support
+This fork adds full Intel Arc GPU (XPU) support. See [PORTING_NOTES.md](PORTING_NOTES.md) for details on what was fixed and known issues. Tested on Arc B580 (Battlemage, 12GB), WSL2, Triton 3.7.0, PyTorch XPU stable.
 
 > First open-source implementation of [Google's TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026). 3.5 bits/value = near-identical quality to FP16. Provably within 2.7× of information-theoretic optimal.
 
@@ -75,7 +77,7 @@ Input KV vector (FP16, d=128)
 
 ```bash
 # Install
-git clone https://github.com/OnlyTerp/turboquant.git
+git clone https://github.com/hammurabi-coder/turboquant-xpu.git
 cd turboquant
 pip install -e .
 
@@ -153,7 +155,8 @@ This is an **independent open-source implementation** of the TurboQuant algorith
 - **Paper**: [TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate](https://arxiv.org/abs/2504.19874) — Published at **ICLR 2026**
 - **Authors**: Amir Zandieh (Google Research), Majid Daliri (NYU), Majid Hadian (Google DeepMind), Vahab Mirrokni (Google Research)
 - **Related work**: [PolarQuant](https://arxiv.org/abs/2502.02617), [QJL](https://arxiv.org/abs/2406.03482) by overlapping authors
-- **Implementation**: [Terp AI Labs](https://github.com/OnlyTerp)
+- **XPU Port**: [hammurabi-coder](https://github.com/hammurabi-coder) — Intel Arc B580 port, asymmetric attention, bug fixes
+- **Original**: [OnlyTerp](https://github.com/OnlyTerp/turboquant)
 
 This implementation is not affiliated with or endorsed by Google Research, Google DeepMind, or NYU. We built it from the public paper to make TurboQuant accessible to the open-source community.
 
