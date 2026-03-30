@@ -163,9 +163,9 @@ for l in range(n_layers):
         v_f = pkv.layers[l].values[:, h:h+1, :, :].reshape(-1, head_dim).float()
         S_seed = qjl_seed(l, h)
         kc = turboquant_encode_internal(k_f, config.codebook, rotations[l][h],
-                                        S_matrices[l][h], S_seed)
+                                        S_matrices[l][h], mixed=None)
         vc = turboquant_encode_internal(v_f, config.codebook, rotations[l][h],
-                                        S_matrices[l][h], S_seed)
+                                        S_matrices[l][h], mixed=None)
         k_parts.append(kc); v_parts.append(vc)
         # Debug: print size of first K and V compressed object
         if (l, h) == debug_layer_h:
