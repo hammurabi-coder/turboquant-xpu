@@ -139,11 +139,14 @@ def install_turboquant_hook(model, tqc_config, pkv=None):
                 seq_len = hidden_states.shape[1]  # batch dimension
                 is_decode = (past_key_values is not None) and (seq_len == 1)
                 if not is_decode:
+                    kwargs.pop('use_cache', None)  # Prevent duplicate kwarg error
+                    kwargs.pop('past_key_values', None)  # Clean kwargs
                     return originals[layer_idx](
                         hidden_states,
                         position_embeddings=position_embeddings,
                         attention_mask=attention_mask,
-                        past_key_values=past_key_values,
+                        past_key_values=None,  # FIX: prevent double-write — hook uses tqc_cache
+                        use_cache=False,       # FIX: prevents original attn from writing to pkv
                         **kwargs,
                     )
 
@@ -597,13 +600,14 @@ if __name__ == "__main__":
     t0 = time.time()
 
     with torch.no_grad():
-        gen_out_hooked = m.generate(
-            last_token.to(device),
-            max_new_tokens=DECODE_TOKENS,
-            do_sample=False,
-            pad_token_id=tok.pad_token_id,
-            eos_token_id=tok.eos_token_id,
-        )
+        gen_tokens = last_token.clone()
+        for _ in range(DECODE_TOKENS):
+            logits = m.forward(gen_tokens.to(device), use_cache=True).logits
+            next_tok = logits[0, -1].argmax()
+            gen_tokens=torch.cat([gen_tokens.to(next_tok.device), next_tok.unsqueeze(0).unsqueeze(0)], dim=1)
+            if next_tok.item() == tok.eos_token_id:
+                break
+        gen_out_hooked = gen_tokens
 
     torch.xpu.synchronize()
     t_hooked = time.time() - t0
