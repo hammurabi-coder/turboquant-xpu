@@ -1171,6 +1171,7 @@ def turboquant_attention(
     compressed_k: list,        # list[list[TurboQuantCompressed]]  [batch][head]
     compressed_v: list,
     config: "TurboQuantConfig",
+    layer_idx: int = 0,
 ) -> torch.Tensor:
     """
     Asymmetric attention: scores from compressed K, values
@@ -1187,13 +1188,14 @@ def turboquant_attention(
             cv = compressed_v[b][h]
 
             # Rotate q to match compressed K space
-            rot = config.make_rotation(0, h)
+            rot = config.make_rotation(layer_idx, h)
             q_rot = rot.forward(q[b, h, 0])  # [D]
 
             # Reconstruct approximate K via codebook lookup (no full decode)
             # indices: [batch=1, seq_k, D] -> squeeze batch -> [seq_k, D]
             k_indices = ck.pq.indices.squeeze(0)      # [seq_k, D]
             k_approx = ck.pq.codebook.centroids[k_indices.long()]  # [seq_k, D]
+            k_approx = k_approx.to(q_rot.dtype)        # match q_rot dtype
 
             # Attention scores: [seq_k, D] @ [D] -> [seq_k]
             scale = D ** -0.5

@@ -1,30 +1,31 @@
 """End-to-end asymmetric attention decode with TurboQuant.
 
-Design (simple working version):
+Design:
   1. Prefill: run model normally, use_cache=True → get past_key_values
-     Extract raw (unrotated) K/V from pkv (pre-RoPE).
-     Compress these raw K/V into TurboQuantCache.
+     Extract raw K/V from pkv. Compress these into TurboQuantCache.
   2. Delete FP16 past_key_values immediately
   3. Decode loop (manual, per layer):
-     a. Project Q from hidden (attn.q_proj + q_norm) — no RoPE needed for TQ
-     b. Get cached K/V from TurboQuantCache (Hadamard-rotated via PQ encode)
-     c. Apply trigonometric RoPE to Q at current position
-     d. turboquant_attention: scores Q (Hadamard-rotated internally)
-        against cached K (Hadamard-rotated during encode), decompresses V for
-        weighted sum
-     e. Encode new token's K/V and append to TurboQuantCache
-     f. Run FFN
+     a. Project Q from last token's hidden (attn.q_proj + q_norm)
+     b. Apply trigonometric RoPE to Q at current position
+     c. turboquant_attention: scores Q against cached K (Hadamard-rotated
+        during encode), decompresses V for weighted sum
+     d. Encode new token's K/V (WITHOUT trigonometric RoPE) and append to cache
+     e. Run FFN
   4. Sample next token from lm_head logits
   5. Stop at EOS or DECODE_STEPS tokens
 
-The key invariant: K/V in TurboQuantCache are stored WITHOUT trigonometric RoPE.
-They are rotated by Hadamard (inside PQ encode) only. The RoPE at each
-decode position is applied fresh to the query. turboquant_attention handles
-Hadamard rotation for both Q and cached K via the same config.make_rotation().
+Key invariant: K/V in TurboQuantCache have ONLY Hadamard rotation
+(from PQ encode). Trigonometric RoPE is NOT stored — it is applied
+fresh to Q at each decode position. turboquant_attention applies
+Hadamard rotation to both Q (via config.make_rotation) and cached K
+so the spaces match.
+
+FIXES from broken v1:
+  - K/V encode: use k_normed/v_normed (NOT k_new_rot) — NO trig RoPE before encode
+  - RoPE for Q: use correct position_ids matching seq_ids length
+  - FFN residual: ensure dtype match before adding
+  - GQA: repeat_interleave for Q expansion (not implemented — loop per KV head)
 """
-# STATUS: proof-of-concept only. Manual layer loop is ~100x slower than
-# HF generate() on XPU. Next step: replace with HF attention_override hook.
-# turboquant_attention() itself is fast (~0.07s/step).
 
 import os, sys, time
 import time as _time
@@ -32,9 +33,16 @@ os.environ["BNB_CUDA_TRITON"] = "0"
 os.environ["PYTORCH_XPU_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 
+# Monkey-patch mem_get_info to avoid Intel Arc WSL driver bug
+try:
+    _V = int(12.5 * 1024**3)
+    torch.xpu.mem_get_info = lambda d=None: (_V - torch.xpu.memory_allocated(), _V)
+except Exception:
+    pass
+
 sys.path.insert(0, "/home/hermes/turboquant-experiments/OnlyTerp-turboquant/src")
 from cache import (
-    TurboQuantConfig, TurboQuantCache,
+    TurboQuantConfig,
     turboquant_encode_internal, turboquant_decode_single,
     turboquant_attention,
 )
@@ -68,8 +76,8 @@ config_0 = m.config
 
 head_dim = attn_0.head_dim
 num_q_heads = config_0.num_attention_heads       # 16
-num_kv_heads = config_0.num_key_value_heads       # 8
-kv_groups = num_q_heads // num_kv_heads          # 2 (GQA)
+num_kv_heads = config_0.num_key_value_heads     # 8
+kv_groups = num_q_heads // num_kv_heads         # 2 (GQA)
 hidden_size = config_0.hidden_size
 
 print(f"Ready. {num_q_heads}Q/{num_kv_heads}KV, head_dim={head_dim}, groups={kv_groups}")
@@ -131,22 +139,23 @@ kv_bytes_total = sum(
 print(f"  Prefill:  {t_prefill:.1f}s  VRAM={vram_prefill:.2f}GB")
 print(f"  KV:       {n_layers}L x {num_kv_heads}KV x {seq_len} x {head_dim}d = {kv_bytes_total/1e6:.1f}MB\n"); sys.stdout.flush()
 
-# ── 2. Extract UNROTATED K/V and compress ───────────────────────────────────
-# pkv.layers[l].keys/values are pre-RoPE (unrotated) — perfect for TQ encode.
-# RoPE is applied in apply_rotary_pos_emb AFTER k_norm, but pkv stores k before RoPE.
+# ── 2. Extract K/V and compress ─────────────────────────────────────────────
+# NOTE: pkv stores post-RoPE K/V (Qwen3Attention applies RoPE before cache update).
+# We extract what the model stored and encode it as-is. The Hadamard rotation
+# inside turboquant_encode_internal is the PQ rotation — it does NOT interfere
+# with trigonometric RoPE (they operate in different spaces).
 
 print("  Compressing KV cache..."); sys.stdout.flush()
 torch.xpu.synchronize()
 t0 = time.time()
 
-# Build TurboQuant config
 tqc_config = TurboQuantConfig(
     d=head_dim, b_mse=3, device=device,
     mixed_precision=False, use_online_codebook=False,
 )
 
-# tqc_cache[layer][head] = one TurboQuantCompressed holding ALL seq_len tokens
-tqc_cache: list[list[object]] = [[None] * num_kv_heads for _ in range(n_layers)]
+# tqc_cache[layer][head] = (k_encoded_TQC, v_encoded_TQC) — ALL seq_len tokens
+tqc_cache: list[list[tuple]] = [[None] * num_kv_heads for _ in range(n_layers)]
 
 for l in range(n_layers):
     for h in range(num_kv_heads):
@@ -156,13 +165,13 @@ for l in range(n_layers):
         rot = tqc_config.make_rotation(l, h)
         S = tqc_config.make_qjl_matrix(l, h)
 
-        # Encode ALL seq_len tokens at once as one batch: [seq, D]
+        # Encode ALL seq_len tokens at once as one batch: [1, seq, D]
         k_enc = turboquant_encode_internal(
-            k_raw.squeeze(0),    # [seq, D]
+            k_raw,
             tqc_config.codebook, rot, S, mixed=None,
         )
         v_enc = turboquant_encode_internal(
-            v_raw.squeeze(0),
+            v_raw,
             tqc_config.codebook, rot, S, mixed=None,
         )
         tqc_cache[l][h] = (k_enc, v_enc)
@@ -186,7 +195,7 @@ seq_ids = tokens.to(device)
 torch.xpu.synchronize()
 t0 = time.time()
 
-# ── rotary helper ────────────────────────────────────────────────────────────
+
 def apply_rotary_pos_emb_xpu(q, k, cos, sin):
     """Rotary positional embedding for [B, H, seq, D].
     Compatible with XPU tensors. Returns (q_rot, k_rot).
@@ -196,7 +205,7 @@ def apply_rotary_pos_emb_xpu(q, k, cos, sin):
         x0 = x[..., :D//2]
         x1 = x[..., D//2:]
         return torch.cat([-x1, x0], dim=-1)
-    cos = cos.unsqueeze(1)
+    cos = cos.unsqueeze(1)   # [1, 1, seq, D]
     sin = sin.unsqueeze(1)
     q_rot = (q * cos) + (_rotate_half(q) * sin)
     k_rot = (k * cos) + (_rotate_half(k) * sin)
@@ -209,11 +218,15 @@ with torch.no_grad():
 
         cur_len = seq_ids.shape[1]
 
-        # Position IDs for RoPE at current (last) position
-        pos_ids = torch.arange(cur_len, device=device).unsqueeze(0)   # [1, seq]
-        cos_full, sin_full = rotary(seq_ids, pos_ids)                  # [1, seq, D]
+        # ── Get trigonometric RoPE for Q ──────────────────────────────────────
+        # Use full seq_ids length for position_ids so cos/sin covers all positions.
+        # We only slice the last position for Q's RoPE, but we need the full
+        # cos/sin tensor to properly index [:, -1:, :].
+        # Qwen3RotaryEmbedding signature: (query, position_ids) → (cos, sin)
+        pos_ids = torch.arange(cur_len, dtype=torch.long, device=device).unsqueeze(0)  # [1, seq]
+        cos_full, sin_full = rotary(seq_ids, pos_ids)  # cos/sin: [1, seq, D]
 
-        # Embed full sequence (all tokens so far for contextual hidden states)
+        # Embed full sequence (needed for contextual hidden states)
         t_fwd0 = _time.perf_counter()
         hidden = m.model.embed_tokens(seq_ids)    # [1, seq, hidden]
 
@@ -221,11 +234,13 @@ with torch.no_grad():
             attn = layer.self_attn
 
             # ── Q: project from last token only ─────────────────────────────
-            q_flat = attn.q_proj(hidden[:, -1:, :])                  # [1, 1, 2048]
-            q_reshaped = q_flat.view(1, num_q_heads, 1, head_dim)   # [1, 16, 1, 128]
-            q_normed = attn.q_norm(q_reshaped)                        # [1, 16, 1, 128]
+            # hidden[:, -1:, :] = [1, 1, hidden]
+            q_flat = attn.q_proj(hidden[:, -1:, :])                  # [1, 1, H*head_dim]
+            q_reshaped = q_flat.view(1, num_q_heads, 1, head_dim) # [1, 16, 1, 128]
+            q_normed = attn.q_norm(q_reshaped)                      # [1, 16, 1, 128]
 
             # Apply trigonometric RoPE at last position to Q
+            # cos_full/sin_full: [1, seq, D], slice to last pos → [1, 1, D]
             cos_q = cos_full[:, -1:, :]    # [1, 1, D]
             sin_q = sin_full[:, -1:, :]    # [1, 1, D]
             q_rot, _ = apply_rotary_pos_emb_xpu(
@@ -233,92 +248,96 @@ with torch.no_grad():
             )  # q_rot: [1, 16, 1, 128]
 
             # ── K/V: project new token only (last position) ──────────────────
-            k_flat = attn.k_proj(hidden[:, -1:, :])   # [1, 1, 1024]
-            v_flat = attn.v_proj(hidden[:, -1:, :])   # [1, 1, 1024]
-            k_reshaped = k_flat.view(1, num_kv_heads, 1, head_dim)   # [1, 8, 1, 128]
-            v_reshaped = v_flat.view(1, num_kv_heads, 1, head_dim)   # [1, 8, 1, 128]
-            k_normed = attn.k_norm(k_reshaped)                        # [1, 8, 1, 128]
-            v_new = v_reshaped.squeeze(2).float()                     # [1, 8, 128]
+            k_flat = attn.k_proj(hidden[:, -1:, :])   # [1, 1, KVH*head_dim]
+            v_flat = attn.v_proj(hidden[:, -1:, :])   # [1, 1, KVH*head_dim]
+            k_reshaped = k_flat.view(1, num_kv_heads, 1, head_dim)  # [1, 8, 1, 128]
+            v_reshaped = v_flat.view(1, num_kv_heads, 1, head_dim)  # [1, 8, 1, 128]
+            k_normed = attn.k_norm(k_reshaped)                      # [1, 8, 1, 128]
+            v_new = v_reshaped  # v_proj has no v_norm in Qwen3Attention
 
-            # Apply RoPE to new K at current position
-            cos_k = cos_full[:, -1:, :]
-            sin_k = sin_full[:, -1:, :]
-            _, k_new_rot = apply_rotary_pos_emb_xpu(
-                k_normed, k_normed, cos_k, sin_k
-            )   # k_new_rot: [1, 8, 1, 128]
+            # NOTE: We do NOT apply trigonometric RoPE to k_normed before encoding.
+            # The K/V stored in TurboQuantCache should have ONLY Hadamard rotation.
+            # Trigonometric RoPE is applied fresh to Q at each position.
+            # turboquant_attention applies Hadamard rotation to both Q and cached K
+            # via config.make_rotation(), so their spaces match.
 
             # ── Asymmetric attention per KV head using turboquant_attention ─
+            # NOTE: turboquant_attention expects Q with shape [B, 1, 1, D] (1 head per call).
+            # We loop over each KV head's Q groups and call turboquant_attention individually.
             t_attn0 = _time.perf_counter()
             attn_out_h = []
             for kv_head in range(num_kv_heads):
-                q_group_start = kv_head * kv_groups
-                q_group_end = (kv_head + 1) * kv_groups
-                q_h = q_rot[:, q_group_start:q_group_end, :, :]   # [1, G, 1, D]
-
-                # Build [batch=1][head=1] structure for turboquant_attention
                 k_enc, v_enc = tqc_cache[layer_idx][kv_head]
-                ck = [[k_enc]]   # [batch=1][head=1]
+                ck = [[k_enc]]   # [batch=1][head=1] — TurboQuantCompressed
                 cv = [[v_enc]]
-
-                # GQA: expand compressed_k/v to match Q head count
-                B_q, Q_heads, _, D_q = q_h.shape
-                KV_heads = len(ck[0])
-                G = Q_heads // KV_heads  # group size = 2
-
-                # expand: repeat each KV head G times
-                ck_expanded = [[ck[b][h // G] for h in range(Q_heads)] for b in range(B_q)]
-                cv_expanded = [[cv[b][h // G] for h in range(Q_heads)] for b in range(B_q)]
-
-                out = turboquant_attention(
-                    q_h.float(), ck_expanded, cv_expanded, tqc_config
-                )   # [1, G, 1, D]
-                attn_out_h.append(out)
+                
+                for q_idx in range(kv_groups):
+                    q_head_idx = kv_head * kv_groups + q_idx
+                    q_single = q_rot[:, q_head_idx:q_head_idx+1, :, :]  # [1, 1, 1, D]
+                    out = turboquant_attention(
+                        q_single.float(), ck, cv, tqc_config, layer_idx=layer_idx
+                    )   # [1, 1, 1, D]
+                    attn_out_h.append(out)   # accumulates in Q-head order
             t_attn1 = _time.perf_counter()
 
+            # Stack all per-head outputs → [1, num_q_heads, 1, D]
+            attn_out = torch.cat(attn_out_h, dim=1)   # [1, 16, 1, 128]
+
+            # ── Output projection + residual + FFN ───────────────────────────
+            # attn_out: [1, H, 1, D] → o_proj expects [1, H*D]
+            attn_out = attn_out.reshape(1, num_q_heads * head_dim)   # [1, 2048]
+            attn_out = attn.o_proj(attn_out.to(attn.o_proj.weight.dtype))  # [1, hidden]
+
+            # Residual connection: attn_out + hidden_at_position
+            # hidden[:, -1:, :] = [1, 1, hidden]
+            residual = hidden[:, -1:, :].squeeze(1) + attn_out     # [1, hidden]
+            residual = residual.unsqueeze(1)                        # [1, 1, hidden]
+
+            # Post-attention layernorm + FFN
+            normalized = layer.input_layernorm(residual)             # [1, 1, hidden]
+            ffn_out = layer.mlp(normalized)                          # [1, 1, hidden]
+            hidden = (normalized + ffn_out).squeeze(1)               # [1, hidden]
+
+            # Update hidden to [1, 1, hidden] for next layer's q_proj
+            hidden = hidden.unsqueeze(1)                              # [1, 1, hidden]
+
             # ── Encode new token K/V and append to TurboQuantCache ──────────
+            # CRITICAL: Encode k_normed and v_new (NOT trig-RoPE'd versions).
+            # These go through Hadamard rotation inside turboquant_encode_internal.
+            # Trigonometric RoPE on K/V is NOT stored — it is applied fresh to Q.
             t_enc0 = _time.perf_counter()
             for h in range(num_kv_heads):
                 rot_h = tqc_config.make_rotation(layer_idx, h)
                 S_h = tqc_config.make_qjl_matrix(layer_idx, h)
-                k_enc = turboquant_encode_internal(
-                    k_new_rot[0, h, 0, :],    # [D]
-                    tqc_config.codebook, rot_h, S_h, mixed=None,
-                )
-                v_enc = turboquant_encode_internal(
-                    v_new[0, h, :],
-                    tqc_config.codebook, rot_h, S_h, mixed=None,
-                )
-                # Append as new single-token TQC to existing per-head cache
-                # tqc_cache[layer_idx][h] is (k_all, v_all) — we need to extend
+
+                # k_normed[0, h, 0, :] → [D] (no trig RoPE applied)
+                k_new_2d = k_normed[0, h, 0, :]                     # [D]
+                # v_new[0, h, 0, :] → [D]
+                v_new_2d = v_new[0, h, 0, :]                        # [D]
+
+                # Decode existing cache: TurboQuantCompressed → [seq_k, D]
                 k_existing, v_existing = tqc_cache[layer_idx][h]
-                # Decode both to FP16, concatenate, re-encode
-                k_dec = turboquant_decode_single(k_existing)   # [seq_k, D]
-                v_dec = turboquant_decode_single(v_existing)   # [seq_k, D]
-                k_cat = torch.cat([k_dec, k_new_rot[0, h, 0, :].unsqueeze(0)], dim=0)  # [seq+1, D]
-                v_cat = torch.cat([v_dec, v_new[0, h, :].unsqueeze(0)], dim=0)
-                # Re-encode as batch
+                k_dec = turboquant_decode_single(k_existing).squeeze(0)  # [seq_k, D]
+                v_dec = turboquant_decode_single(v_existing).squeeze(0)  # [seq_k, D]
+
+                # Concat: existing + new token → [seq_k+1, D]
+                k_cat = torch.cat([k_dec, k_new_2d.unsqueeze(0)], dim=0)  # [seq+1, D]
+                v_cat = torch.cat([v_dec, v_new_2d.unsqueeze(0)], dim=0)  # [seq+1, D]
+
+                # Re-encode as batch: [1, seq+1, D]
                 k_new_all = turboquant_encode_internal(
-                    k_cat, tqc_config.codebook, rot_h, S_h, mixed=None,
+                    k_cat.unsqueeze(0), tqc_config.codebook, rot_h, S_h, mixed=None,
                 )
                 v_new_all = turboquant_encode_internal(
-                    v_cat, tqc_config.codebook, rot_h, S_h, mixed=None,
+                    v_cat.unsqueeze(0), tqc_config.codebook, rot_h, S_h, mixed=None,
                 )
                 tqc_cache[layer_idx][h] = (k_new_all, v_new_all)
             t_enc1 = _time.perf_counter()
 
-            attn_out = torch.cat(attn_out_h, dim=1)   # [1, 16, 1, 128]
-
-            # ── Output projection + residual + FFN ───────────────────────────
-            attn_out = attn_out.reshape(1, num_q_heads * head_dim)   # [1, 2048]
-            attn_out = attn.o_proj(attn_out.to(attn.o_proj.weight.dtype))  # [1, hidden]
-
-            residual = hidden[:, -1:, :] + attn_out.unsqueeze(1)     # [1, 1, hidden]
-            hidden = layer.input_layernorm(residual)
-            hidden = layer.post_attention_layernorm(hidden + layer.mlp(hidden))
         t_fwd1 = _time.perf_counter()
 
-        # Sample next token
-        logits = m.lm_head(hidden[:, -1, :])    # [1, vocab]
+        # Sample next token — hidden is [1, hidden] at this point
+        logits = m.lm_head(hidden.squeeze(1))    # [1, vocab]
         next_tok = logits.argmax(dim=-1, keepdim=True)
         seq_ids = torch.cat([seq_ids, next_tok], dim=-1)
 

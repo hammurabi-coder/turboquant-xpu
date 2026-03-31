@@ -1,0 +1,641 @@
+"""
+HF generate() hook for TurboQuant KV cache compression.
+
+Architecture:
+  1. Run model.generate() normally through prefill — past_key_values grows.
+  2. Call install_turboquant_hook(model, tqc_config, pkv) to compress pkv
+     and install hooks.
+  3. Continue generate() — each decode step the hook intercepts attention,
+     encodes new K/V via TurboQuant, calls turboquant_attention(), returns
+     the HF-native (attn_output, attn_weights) tuple.
+  4. generate() handles sampling, stopping, everything as normal.
+  5. Call unhook(model) to restore original forward methods.
+
+Hook replaces Qwen3Attention.forward — the closure captures tqc_cache,
+tqc_config, and the model's attention metadata (num_heads, head_dim, etc.)
+so turboquant_attention() is called correctly per layer.
+"""
+
+# Patches must be at the very top before any model loading
+_VRAM_TOTAL = 12 * 1024**3
+
+import torch
+
+# Set DEBUG_RAW_KV=True to bypass TQ compression and use raw K/V
+# This isolates whether the bug is in the compression or elsewhere
+DEBUG_RAW_KV = True
+
+_VRAM_TOTAL = 12 * 1024**3
+
+def _mem_get_info_patch(d=None):
+    return (_VRAM_TOTAL - torch.xpu.memory_allocated(), _VRAM_TOTAL)
+
+torch.xpu.mem_get_info = _mem_get_info_patch
+
+# ---------------------------------------------------------------------------
+# Imports
+# ---------------------------------------------------------------------------
+import sys
+import time
+import math
+from typing import Optional
+
+sys.path.insert(0, "/home/hermes/turboquant-experiments/OnlyTerp-turboquant/src")
+
+from cache import (
+    TurboQuantConfig,
+    TurboQuantCache,
+    TurboQuantCompressed,
+    turboquant_encode_internal,
+    turboquant_decode_single,
+    turboquant_attention,
+    polarquant_decode,
+)
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+device = torch.device("xpu")
+
+# ---------------------------------------------------------------------------
+# Core hook logic
+# ---------------------------------------------------------------------------
+
+def install_turboquant_hook(model, tqc_config, pkv=None):
+    """
+    Compress past_key_values (from prefill) into tqc_cache, then replace
+    each layer's self_attn.forward with a TurboQuant-aware closure.
+
+    Args:
+        model: AutoModelForCausalLM
+        tqc_config: TurboQuantConfig with d, b_mse, device, etc.
+        pkv: past_key_values from prefill. If None, starts with empty cache
+             (decode-only mode, not yet tested).
+
+    Returns:
+        tqc_cache: list[list[list[(k_c, v_c)]]] — [layer][head][token_idx]
+                   one growing TQC entry per (layer, head) per decode step.
+    """
+    # ── Extract attention geometry from model ────────────────────────────────
+    attn_0 = model.model.layers[0].self_attn
+    num_q_heads = model.config.num_attention_heads
+    num_kv_heads = model.config.num_key_value_heads
+    head_dim = attn_0.head_dim
+    kv_groups = num_q_heads // num_kv_heads  # GQA expansion ratio
+    n_layers = len(model.model.layers)
+
+    print(f"  Hook: {n_layers}L x {num_q_heads}Q / {num_kv_heads}KV heads, "
+          f"head_dim={head_dim}, groups={kv_groups}")
+
+    if pkv is None:
+        print("  No pkv provided — starting with empty tqc_cache (decode-only mode)")
+        tqc_cache = _make_empty_tqc_cache(n_layers, num_kv_heads)
+    else:
+        print(f"  Compressing prefill pkv ({pkv.layers[0].keys.shape[2]} tokens)...")
+        t0 = time.time()
+        tqc_cache = _compress_pkv_to_tqc(pkv, tqc_config, num_kv_heads, n_layers)
+        print(f"  Compress done in {time.time()-t0:.1f}s")
+
+        # Free the FP16 pkv — critical VRAM savings
+        del pkv
+        torch.xpu.empty_cache()
+
+    # ── Store originals and install hooks ────────────────────────────────────
+    originals = []
+    model._tqc_originals = originals  # store for unhook()
+
+    for layer_idx, layer in enumerate(model.model.layers):
+        attn = layer.self_attn
+        originals.append(attn.forward)
+
+        def make_hook(layer_idx=layer_idx, _attn=attn):
+            @torch.no_grad()
+            def turboquant_forward(
+                hidden_states: torch.Tensor,
+                position_embeddings: tuple[torch.Tensor, torch.Tensor],
+                attention_mask: Optional[torch.Tensor] = None,
+                past_key_values=None,
+                **kwargs,
+            ):
+                """
+                Hooked forward for Qwen3Attention.
+
+                Strategy:
+                  - Prefill (past_key_values is None): use ORIGINAL attention.
+                    This lets the model build correct KV cache naturally.
+                  - Decode (past_key_values is not None): use TURBOQUANT attention.
+                    past_key_values means this is a decode step after prefill.
+
+                Responsibilities during decode:
+                  a. Run q_proj → q_norm → reshape → RoPE as normal (Q only)
+                  b. Run k/v projections to get raw K/V (pre-RoPE)
+                  c. Encode new token K/V and append to tqc_cache[layer_idx][head]
+                  d. Batch per-token TQCs into one TQC per head, then call
+                     turboquant_attention() with GQA expansion
+                  e. Apply o_proj and return (attn_output, None) — HF-native signature
+                """
+                # ── Prefill: use original attention ────────────────────────────────
+                # "decode step" means: past_key_values exists AND seq_len==1
+                # (HF sets past_key_values for ALL steps when use_cache=True,
+                #  so we need seq==1 to distinguish decode from prefill).
+                seq_len = hidden_states.shape[1]  # batch dimension
+                is_decode = (past_key_values is not None) and (seq_len == 1)
+                if not is_decode:
+                    return originals[layer_idx](
+                        hidden_states,
+                        position_embeddings=position_embeddings,
+                        attention_mask=attention_mask,
+                        past_key_values=past_key_values,
+                        **kwargs,
+                    )
+
+                # ── Decode: use TurboQuant attention ─────────────────────────────
+                # past_key_values is not None → this is a decode step.
+                # We use TurboQuant-compressed KV from tqc_cache.
+                input_shape = hidden_states.shape[:-1]
+                hidden_shape = (*input_shape, -1, head_dim)
+
+                # Q: full normal path with RoPE
+                q_proj_out = _attn.q_proj(hidden_states)
+                query_states = _attn.q_norm(q_proj_out.view(hidden_shape)).transpose(1, 2)
+
+                # K/V: raw, pre-RoPE — needed for TurboQuant encode
+                key_states = _attn.k_norm(_attn.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+                value_states = _attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+                cos, sin = position_embeddings
+
+                # RoPE on Q (for attention scoring) and K (for KV cache storage)
+                # Both Q and K need RoPE applied before attention scoring
+                query_states, key_states = _apply_rotary_pos_emb(
+                    query_states, key_states, cos, sin
+                )
+
+                # ── Encode new K/V and append to tqc_cache ─────────────────────
+                # During decode: seq=1 (single new token)
+                seq_len = key_states.shape[2]
+                k_new = key_states[..., -1:, :]    # [B, num_kv_heads, 1, head_dim]
+                v_new = value_states[..., -1:, :]  # [B, num_kv_heads, 1, head_dim]
+
+                for head_idx in range(num_kv_heads):
+                    k_vec = k_new[0, head_idx, 0, :]   # [head_dim]
+                    v_vec = v_new[0, head_idx, 0, :]   # [head_dim]
+
+                    if DEBUG_RAW_KV:
+                        # Store raw (no compression) for debugging
+                        k_c = k_vec.float()
+                        v_c = v_vec.float()
+                    else:
+                        rotation = tqc_config.make_rotation(layer_idx, head_idx)
+                        S = tqc_config.make_qjl_matrix(layer_idx, head_idx)
+                        k_c = turboquant_encode_internal(k_vec, tqc_config.codebook,
+                                                         rotation, S, mixed=None)
+                        v_c = turboquant_encode_internal(v_vec, tqc_config.codebook,
+                                                         rotation, S, mixed=None)
+                    tqc_cache[layer_idx][head_idx].append((k_c, v_c))
+
+                # ── Batch per-token TQCs into one TQC per head ─────────────────
+                # tqc_cache[layer][head] = list of (k_c, v_c) per token
+                # turboquant_attention expects: compressed_k[b][h] -> TurboQuantCompressed
+                # Build as nested list: compressed_k[b=0] = [head_0_TQC, head_1_TQC, ...]
+                compressed_k = []
+                compressed_v = []
+
+                if DEBUG_RAW_KV:
+                    # Raw tensors: just stack them
+                    for head_idx in range(num_kv_heads):
+                        seq_len_cached = len(tqc_cache[layer_idx][head_idx])
+                        k_raw = torch.stack([
+                            tqc_cache[layer_idx][head_idx][t][0].float()
+                            for t in range(seq_len_cached)
+                        ])  # [seq_k, D]
+                        v_raw = torch.stack([
+                            tqc_cache[layer_idx][head_idx][t][1].float()
+                            for t in range(seq_len_cached)
+                        ])  # [seq_k, D]
+                        compressed_k.append(k_raw)
+                        compressed_v.append(v_raw)
+                else:
+                    for head_idx in range(num_kv_heads):
+                        seq_len_cached = len(tqc_cache[layer_idx][head_idx])
+                        cached_k = tqc_cache[layer_idx][head_idx]
+
+                        # ── Batch K ────────────────────────────────────────────────────
+                        first_kpq = cached_k[0][0].pq
+                        k_norm_batch = torch.stack([
+                            cached_k[t][0].pq.norm.squeeze(0)
+                            for t in range(seq_len_cached)
+                        ])  # [seq_len_cached, d]
+                        k_indices_batch = torch.cat([
+                            cached_k[t][0].pq.indices for t in range(seq_len_cached)
+                        ], dim=0)
+                        batched_pq_k = _batch_polarquant_compressed(
+                            first_kpq, k_norm_batch, k_indices_batch
+                        )
+                        k_c_batch = TurboQuantCompressed(pq=batched_pq_k, qjl=cached_k[0][0].qjl)
+
+                        # ── Batch V (use V's own first pq, NOT K's) ───────────────────
+                        first_vpq = cached_k[0][1].pq
+                        v_norm_batch = torch.stack([
+                            cached_k[t][1].pq.norm.squeeze(0)
+                            for t in range(seq_len_cached)
+                        ])
+                        v_indices_batch = torch.cat([
+                            cached_k[t][1].pq.indices
+                            for t in range(seq_len_cached)
+                        ], dim=0)
+                        batched_pq_v = _batch_polarquant_compressed(
+                            first_vpq, v_norm_batch, v_indices_batch
+                        )
+                        v_c_batch = TurboQuantCompressed(pq=batched_pq_v, qjl=cached_k[0][1].qjl)
+
+                        compressed_k.append(k_c_batch)
+                        compressed_v.append(v_c_batch)
+
+                # ── GQA: expand KV heads to Q heads ───────────────────────────
+                # turboquant_attention loops over q.shape[1] heads.
+                # For GQA: each Q head h uses KV head h // kv_groups.
+                B = query_states.shape[0]
+                q_expanded_list = []
+                ck_expanded_list = []
+                cv_expanded_list = []
+
+                for b in range(B):
+                    q_head_list = []
+                    ck_head_list = []
+                    cv_head_list = []
+                    for h in range(num_q_heads):
+                        kv_head = h // kv_groups
+                        q_head_list.append(query_states[b, h, 0, :])     # [D]
+                        ck_head_list.append(compressed_k[kv_head])
+                        cv_head_list.append(compressed_v[kv_head])
+                    q_expanded_list.append(torch.stack(q_head_list))          # [H, D]
+                    ck_expanded_list.append(ck_head_list)
+                    cv_expanded_list.append(cv_head_list)
+
+                # Stack into [B, H, 1, D] for q, [B][H] for compressed_k/v
+                q_final = torch.stack(q_expanded_list).unsqueeze(2)  # [B, H, 1, D]
+
+                # ── Decode K from PQ (full decode for correctness) ─────────────
+                # NOTE: turboquant_attention scoring uses PQ(K) codebook vectors vs Q.
+                # This is only correct when Q and K share the same vector space.
+                # With RoPE models, K stored pre-RoPE and Q post-RoPE are in
+                # different spaces — direct PQ(K) @ Q scoring is incorrect.
+                # FIX: fully decode K before attention to restore correctness.
+                # The VRAM savings come from V-only compression (V is equally large).
+                k_decoded_list = []
+                for h in range(num_q_heads):
+                    kv_head = h // kv_groups
+                    ck = compressed_k[kv_head]
+                    if DEBUG_RAW_KV:
+                        # ck is raw [seq_k, D] float tensor
+                        k_full = ck
+                    else:
+                        k_full = turboquant_decode_single(ck)  # [seq_k, D]
+                    k_decoded_list.append(k_full)
+                v_decoded_list = []
+                for h in range(num_q_heads):
+                    kv_head = h // kv_groups
+                    cv = compressed_v[kv_head]
+                    if DEBUG_RAW_KV:
+                        v_full = cv
+                    else:
+                        v_full = turboquant_decode_single(cv)  # [seq_k, D]
+                    v_decoded_list.append(v_full)
+
+                # ── Standard attention with fully-decoded K and V ──────────────
+                # q_final: [B, H, 1, D]; k_decoded_list[h]: [seq_k, D]
+                # For each batch and head: compute attention scores normally
+                all_outputs = []
+                for b in range(B):
+                    head_outputs = []
+                    for h in range(num_q_heads):
+                        k_h = k_decoded_list[h]                  # [seq_k, D]
+                        v_h = v_decoded_list[h]                  # [seq_k, D]
+                        q_h = q_final[b, h, 0, :]                # [D]
+
+                        # Scores: [seq_k, D] @ [D] -> [seq_k]
+                        scale = head_dim ** -0.5
+                        scores = (k_h.float() @ q_h.float()) * scale
+                        weights = torch.softmax(scores, dim=0)   # [seq_k]
+
+                        # Weighted sum of V
+                        out = (weights.unsqueeze(1) * v_h.float()).sum(dim=0)  # [D]
+                        head_outputs.append(out)
+                    all_outputs.append(torch.stack(head_outputs))  # [H, D]
+                attn_out = torch.stack(all_outputs).unsqueeze(2)  # [B, H, 1, D]
+
+                # ── Output projection ─────────────────────────────────────────
+                attn_out_for_diag = attn_out.clone()
+                attn_out = attn_out.transpose(1, 2).contiguous()  # [B, 1, H, D]
+                attn_out = attn_out.view(*input_shape, -1)         # [B, 1, hidden]
+                attn_out = attn_out.to(hidden_states.dtype)
+                attn_out = _attn.o_proj(attn_out)
+
+                # DIAG: compare attn output norms with baseline
+                import sys
+                print(f"[DIAG layer={layer_idx}] attn_out norm={attn_out.norm().item():.4f}  pre-proj norm={attn_out_for_diag.norm().item():.4f}", file=sys.stderr)
+
+                return (attn_out, None)
+
+            return turboquant_forward
+
+        attn.forward = make_hook()
+
+    print(f"  Hooks installed on {n_layers} layers")
+    return tqc_cache
+
+
+def _batch_polarquant_compressed(first_pq, norm_batch, indices_batch):
+    """Batch a list of per-token PQ compressed vecs into one PolarQuantCompressed.
+
+    Same pattern as TurboQuantCache.compute_attention lines 1019-1055.
+    Returns a PolarQuantCompressed with batched norm and indices along dim=0.
+    """
+    from cache import PolarQuantCompressed
+    return PolarQuantCompressed(
+        norm=norm_batch,                          # [seq, d]
+        indices=indices_batch,                   # [seq, d_packed] or [seq, d]
+        codebook=first_pq.codebook,
+        rotation=first_pq.rotation,
+        original_dim=first_pq.original_dim,
+        regular_norm=None,
+        outlier_norm=None,
+        regular_indices=first_pq.regular_indices,
+        outlier_indices=first_pq.outlier_indices,
+        regular_quantized_indices=None,
+        outlier_quantized_indices=None,
+        codebook_regular=getattr(first_pq, 'codebook_regular', None),
+        codebook_outlier=getattr(first_pq, 'codebook_outlier', None),
+        rotation_regular=getattr(first_pq, 'rotation_regular', None),
+        rotation_outlier=getattr(first_pq, 'rotation_outlier', None),
+    )
+
+
+def unhook(model):
+    """Restore all original forward methods."""
+    originals = getattr(model, '_tqc_originals', None)
+    if originals is None:
+        print("  Warning: no originals found — nothing to unhook")
+        return
+
+    for layer_idx, layer in enumerate(model.model.layers):
+        layer.self_attn.forward = originals[layer_idx]
+
+    print(f"  Unhooked {len(originals)} layers — original forward restored")
+    model._tqc_originals = None
+
+
+def _apply_rotary_pos_emb(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+):
+    """Apply rotary position embedding to Q only (k is ignored — K is used raw for TQ encode).
+
+    q: [B, num_q_heads, seq, head_dim]
+    cos, sin: [seq, head_dim/2] — passed from model's position_embeddings
+
+    Inline implementation matching HF apply_rotary_pos_emb:
+        rotate_half(x) = cat([-x2, x1], dim=-1)
+        q_rope = (q * cos.unsqueeze(1)) + (rotate_half(q) * sin.unsqueeze(1))
+    """
+    # Expand cos/sin from [batch, seq, D] to [batch, 1, seq, D] for broadcasting
+    # q is [B, H, seq, D]. cos/sin are [B, seq, D].
+    # unsqueeze(1) → [B, 1, seq, D] — broadcasts with [B, H, seq, D]
+    cos_expanded = cos.unsqueeze(1)   # [B, 1, seq, D]
+    sin_expanded = sin.unsqueeze(1)   # [B, 1, seq, D]
+
+    # rotate_half: split in 2, swap halves
+    def _rotate_half(x):
+        x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+        return torch.cat([-x2, x1], dim=-1)
+
+    q_rope = _rotate_half(q) * sin_expanded + q * cos_expanded
+
+    # Apply same RoPE to k if provided
+    if k is not None:
+        k_rope = _rotate_half(k) * sin_expanded + k * cos_expanded
+    else:
+        k_rope = None
+
+    return q_rope, k_rope
+
+
+def _compress_pkv_to_tqc(pkv, tqc_config, num_kv_heads, n_layers):
+    """
+    Convert HF DynamicCache past_key_values into tqc_cache format.
+
+    pkv.layers[l].keys:   [B, num_kv_heads, seq, head_dim]
+    pkv.layers[l].values: [B, num_kv_heads, seq, head_dim]
+
+    tqc_cache[layer][head] = list of (k_c, v_c) per token position
+    """
+    tqc_cache = _make_empty_tqc_cache(n_layers, num_kv_heads)
+    seq_len = pkv.layers[0].keys.shape[2]
+
+    for layer_idx in range(n_layers):
+        for head_idx in range(num_kv_heads):
+            for tok_idx in range(seq_len):
+                k_vec = pkv.layers[layer_idx].keys[0, head_idx, tok_idx, :]
+                v_vec = pkv.layers[layer_idx].values[0, head_idx, tok_idx, :]
+
+                if DEBUG_RAW_KV:
+                    k_c = k_vec.float()
+                    v_c = v_vec.float()
+                else:
+                    rotation = tqc_config.make_rotation(layer_idx, head_idx)
+                    S = tqc_config.make_qjl_matrix(layer_idx, head_idx)
+                    k_c = turboquant_encode_internal(k_vec, tqc_config.codebook,
+                                                      rotation, S, mixed=None)
+                    v_c = turboquant_encode_internal(v_vec, tqc_config.codebook,
+                                                      rotation, S, mixed=None)
+                tqc_cache[layer_idx][head_idx].append((k_c, v_c))
+
+    return tqc_cache
+
+
+def _make_empty_tqc_cache(n_layers, num_kv_heads):
+    """Create empty tqc_cache: [layer][head] = [] (list of per-token TQC tuples)."""
+    cache = []
+    for _ in range(n_layers):
+        layer_cache = []
+        for _ in range(num_kv_heads):
+            layer_cache.append([])
+        cache.append(layer_cache)
+    return cache
+
+
+# ---------------------------------------------------------------------------
+# Test / __main__
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import os
+    os.environ["BNB_CUDA_TRITON"] = "0"
+    os.environ["PYTORCH_XPU_ALLOC_CONF"] = "expandable_segments:True"
+
+    MODEL = "Qwen/Qwen3-0.6B"
+    PREFILL_TOKENS = 50
+    DECODE_TOKENS = 20
+
+    print("=" * 60)
+    print("TurboQuant HF Hook Integration Test")
+    print("=" * 60)
+
+    # ── Load tokenizer ────────────────────────────────────────────────────────
+    print("\nLoading tokenizer..."); sys.stdout.flush()
+    tok = AutoTokenizer.from_pretrained(
+        "/home/hermes/.cache/huggingface/modules",
+        trust_remote_code=True, padding_side="left"
+    )
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+
+    # ── Load model baseline ──────────────────────────────────────────────────
+    print(f"Loading {MODEL} (4-bit bnb)..."); sys.stdout.flush()
+    from transformers import BitsAndBytesConfig
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=False,
+        bnb_4bit_quant_type="fp4",
+    )
+
+    m = AutoModelForCausalLM.from_pretrained(
+        MODEL, device_map="xpu", trust_remote_code=True,
+        quantization_config=bnb_config, low_cpu_mem_usage=True,
+    ).eval()
+
+    vram_loaded = torch.xpu.max_memory_allocated() / 1e9
+    print(f"  Model loaded. VRAM={vram_loaded:.2f}GB\n"); sys.stdout.flush()
+
+    # ── Prompt ────────────────────────────────────────────────────────────────
+    text = (
+        "In the northern reaches of the Ember Valley, the last remnants of the ancient "
+        "Clockwork Empire lay buried beneath layers of volcanic ash. For three centuries "
+        "the great brass automatons had stood frozen in their eternal gardens."
+    )
+    tokens = tok(text, return_tensors="pt", truncation=True,
+                 max_length=PREFILL_TOKENS)["input_ids"]
+    print(f"  Prompt: {tokens.shape[1]} tokens\n"); sys.stdout.flush()
+
+    # ── BASELINE ─────────────────────────────────────────────────────────────
+    print("--- BASELINE: full generate() ---"); sys.stdout.flush()
+    torch.xpu.reset_peak_memory_stats()
+    torch.xpu.synchronize()
+    t0 = time.time()
+
+    with torch.no_grad():
+        gen_out_baseline = m.generate(
+            tokens.to(device),
+            max_new_tokens=DECODE_TOKENS,
+            do_sample=False,
+            pad_token_id=tok.pad_token_id,
+            eos_token_id=tok.eos_token_id,
+        )
+
+    torch.xpu.synchronize()
+    t_baseline = time.time() - t0
+    vram_baseline = torch.xpu.max_memory_allocated() / 1e9
+    baseline_text = tok.decode(gen_out_baseline[0])
+    print(f"  Baseline: {t_baseline:.1f}s, VRAM={vram_baseline:.2f}GB")
+    print(f"  Output: {baseline_text[:120]}...\n"); sys.stdout.flush()
+
+    # ── TURBOQUANT PATH ───────────────────────────────────────────────────────
+    del m
+    torch.xpu.empty_cache()
+
+    print("--- TURBOQUANT HOOK ---"); sys.stdout.flush()
+    print("Reloading model..."); sys.stdout.flush()
+
+    m = AutoModelForCausalLM.from_pretrained(
+        MODEL, device_map="xpu", trust_remote_code=True,
+        quantization_config=bnb_config, low_cpu_mem_usage=True,
+    ).eval()
+
+    torch.xpu.reset_peak_memory_stats()
+    torch.xpu.synchronize()
+
+    # ── Prefill: get pkv ─────────────────────────────────────────────────────
+    print("  Prefill pass (capturing pkv)..."); sys.stdout.flush()
+    t0 = time.time()
+    with torch.no_grad():
+        prefill_out = m(input_ids=tokens.to(device), use_cache=True)
+    torch.xpu.synchronize()
+    t_prefill = time.time() - t0
+    vram_prefill = torch.xpu.max_memory_allocated() / 1e9
+    print(f"  Prefill: {t_prefill:.1f}s, VRAM={vram_prefill:.2f}GB"); sys.stdout.flush()
+
+    # ── Capture pkv before installing hook ───────────────────────────────────
+    pkv = prefill_out.past_key_values
+
+    # ── Install hook ─────────────────────────────────────────────────────────
+    print("  Installing TurboQuant hook..."); sys.stdout.flush()
+    attn_0 = m.model.layers[0].self_attn
+    head_dim = attn_0.head_dim
+    n_layers = len(m.model.layers)
+    num_kv_heads = m.config.num_key_value_heads
+
+    tqc_config = TurboQuantConfig(
+        d=head_dim, b_mse=3, device=device,
+        mixed_precision=False, use_online_codebook=False,
+    )
+
+    tqc_cache = install_turboquant_hook(m, tqc_config, pkv)
+
+    # pkv is now deleted inside install_turboquant_hook
+    vram_hooked = torch.xpu.memory_allocated() / 1e9
+    print(f"  VRAM after hook install: {vram_hooked:.2f}GB\n"); sys.stdout.flush()
+
+    # ── Generate with hook active ────────────────────────────────────────────
+    # CRITICAL: use last prompt token only, NOT full tokens.
+    # tqc_cache was built from pkv which already has all prefill KV.
+    # Passing full tokens would re-process the entire prompt through the hooked
+    # forward, corrupting tqc_cache with duplicate entries.
+    last_token = tokens[:, -1:]
+
+    print(f"  Decoding {DECODE_TOKENS} tokens with hook active..."); sys.stdout.flush()
+    torch.xpu.reset_peak_memory_stats()
+    torch.xpu.synchronize()
+    t0 = time.time()
+
+    with torch.no_grad():
+        gen_out_hooked = m.generate(
+            last_token.to(device),
+            max_new_tokens=DECODE_TOKENS,
+            do_sample=False,
+            pad_token_id=tok.pad_token_id,
+            eos_token_id=tok.eos_token_id,
+        )
+
+    torch.xpu.synchronize()
+    t_hooked = time.time() - t0
+    vram_hooked_peak = torch.xpu.max_memory_allocated() / 1e9
+    hooked_text = tok.decode(gen_out_hooked[0])
+
+    print(f"\n  TurboQuant hooked: {t_hooked:.1f}s, VRAM={vram_hooked_peak:.2f}GB")
+    print(f"  Output: {hooked_text[:120]}..."); sys.stdout.flush()
+
+    # ── Unhook and verify ────────────────────────────────────────────────────
+    print("\n--- Unhook + verify ---"); sys.stdout.flush()
+    unhook(m)
+
+    with torch.no_grad():
+        verify_out = m.generate(
+            tokens.to(device),
+            max_new_tokens=5,
+            do_sample=False,
+            pad_token_id=tok.pad_token_id,
+            eos_token_id=tok.eos_token_id,
+        )
+    verify_text = tok.decode(verify_out[0])
+    print(f"  After unhook: {verify_text[:80]}...")
+    print("  Model works — unhook successful.")
+
+    # ── Summary ──────────────────────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("SUMMARY")
+    print("=" * 60)
+    print(f"Baseline:  {t_baseline:.1f}s, VRAM={vram_baseline:.2f}GB")
+    print(f"Hooked:   {t_hooked:.1f}s, VRAM={vram_hooked_peak:.2f}GB")
+    print(f"Prefill:  {t_prefill:.1f}s (separate, not in hooked total)")
+    print(f"VRAM delta vs prefill: {vram_prefill - vram_hooked_peak:.2f}GB saved")
+    print(f"\nBaseline output:\n  {baseline_text[:200]}")
+    print(f"\nHooked output:\n  {hooked_text[:200]}")
