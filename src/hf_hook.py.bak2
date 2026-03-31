@@ -23,12 +23,7 @@ import torch
 
 # Set DEBUG_RAW_KV=True to bypass TQ compression and use raw K/V
 # This isolates whether the bug is in the compression or elsewhere
-DEBUG_RAW_KV = False
-
-# When DECODE_FORCE=True, the hook always runs TQ attention (ignoring is_decode).
-# The generate loop should use use_cache=False when this is active.
-# This prevents the model's internal cache from interfering with TQ cache.
-DECODE_FORCE = True
+DEBUG_RAW_KV = True
 
 _VRAM_TOTAL = 12 * 1024**3
 
@@ -38,12 +33,6 @@ def _mem_get_info_patch(d=None):
 torch.xpu.mem_get_info = _mem_get_info_patch
 
 # ---------------------------------------------------------------------------
-# Imports
-# ---------------------------------------------------------------------------
-import sys
-import time
-import math
-from typing import Optional
 
 sys.path.insert(0, "/home/hermes/turboquant-experiments/OnlyTerp-turboquant/src")
 
@@ -107,6 +96,7 @@ def install_turboquant_hook(model, tqc_config, pkv=None):
     originals = []
     model._tqc_originals = originals  # store for unhook()
 
+
     for layer_idx, layer in enumerate(model.model.layers):
         attn = layer.self_attn
         originals.append(attn.forward)
@@ -141,23 +131,20 @@ def install_turboquant_hook(model, tqc_config, pkv=None):
                 # "decode step" means: past_key_values exists AND seq_len==1
                 # (HF sets past_key_values for ALL steps when use_cache=True,
                 #  so we need seq==1 to distinguish decode from prefill).
-                # When DECODE_FORCE=True, always use TQ attention (generate uses use_cache=False).
                 seq_len = hidden_states.shape[1]  # batch dimension
-                is_decode = DECODE_FORCE or ((past_key_values is not None) and (seq_len == 1))
+                is_decode = (past_key_values is not None) and (seq_len == 1)
                 if not is_decode:
-                    kwargs.pop('use_cache', None)  # Prevent duplicate kwarg error
-                    kwargs.pop('past_key_values', None)  # Clean kwargs
                     return originals[layer_idx](
                         hidden_states,
                         position_embeddings=position_embeddings,
                         attention_mask=attention_mask,
+                        past_key_values=past_key_values,
                         **kwargs,
                     )
 
                 # ── Decode: use TurboQuant attention ─────────────────────────────
-                # When DECODE_FORCE=True and use_cache=False, past_key_values is None.
-                # The tqc_cache already has all prefill tokens stored.
-                # We detect decode via DECODE_FORCE flag; use tqc_cache for seq info.
+                # past_key_values is not None → this is a decode step.
+                # We use TurboQuant-compressed KV from tqc_cache.
                 input_shape = hidden_states.shape[:-1]
                 hidden_shape = (*input_shape, -1, head_dim)
 
@@ -332,10 +319,15 @@ def install_turboquant_hook(model, tqc_config, pkv=None):
                 attn_out = torch.stack(all_outputs).unsqueeze(2)  # [B, H, 1, D]
 
                 # ── Output projection ─────────────────────────────────────────
+                attn_out_for_diag = attn_out.clone()
                 attn_out = attn_out.transpose(1, 2).contiguous()  # [B, 1, H, D]
                 attn_out = attn_out.view(*input_shape, -1)         # [B, 1, hidden]
                 attn_out = attn_out.to(hidden_states.dtype)
                 attn_out = _attn.o_proj(attn_out)
+
+                # DIAG: compare attn output norms with baseline
+                import sys
+                print(f"[DIAG layer={layer_idx}] attn_out norm={attn_out.norm().item():.4f}  pre-proj norm={attn_out_for_diag.norm().item():.4f}", file=sys.stderr)
 
                 return (attn_out, None)
 
@@ -374,7 +366,7 @@ def _batch_polarquant_compressed(first_pq, norm_batch, indices_batch):
 
 
 def unhook(model):
-    """Restore all original forward methods."""
+    """Restore all original forward methods and DynamicCache.update."""
     originals = getattr(model, '_tqc_originals', None)
     if originals is None:
         print("  Warning: no originals found — nothing to unhook")
@@ -600,14 +592,13 @@ if __name__ == "__main__":
     t0 = time.time()
 
     with torch.no_grad():
-        gen_tokens = last_token.clone()
-        for _ in range(DECODE_TOKENS):
-            logits = m.forward(gen_tokens.to(device), use_cache=False).logits
-            next_tok = logits[0, -1].argmax()
-            gen_tokens = torch.cat([gen_tokens.to(next_tok.device), next_tok.unsqueeze(0).unsqueeze(0)], dim=1)
-            if next_tok.item() == tok.eos_token_id:
-                break
-        gen_out_hooked = gen_tokens
+        gen_out_hooked = m.generate(
+            last_token.to(device),
+            max_new_tokens=DECODE_TOKENS,
+            do_sample=False,
+            pad_token_id=tok.pad_token_id,
+            eos_token_id=tok.eos_token_id,
+        )
 
     torch.xpu.synchronize()
     t_hooked = time.time() - t0
